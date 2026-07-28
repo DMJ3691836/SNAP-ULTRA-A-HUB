@@ -1,0 +1,1243 @@
+// This source code is subject to the terms of the Apache License 2.0
+// © DMJ3691836
+
+//@version=6
+// =============================================================================
+// SNAP ULTRA A+ HUB — DEV 007
+// =============================================================================
+// Changes from DEV 006:
+//   • Indicator title corrected: "SNAP ULTRA A+ HUB DEV 007" (DEV 002 text removed)
+//   • Pine Script upgraded to v6
+//   • Execution Mode (Lightweight) toggle added — auto-disables heavy drawings
+//     without permanently changing any saved settings
+//   • showHeavyDrawings = not executionMode gates all heavy visual blocks
+//   • Signal reference labels corrected:
+//       - Entry price line now labelled "ENTRY" (was "SWEEP" / misleading)
+//       - Mean reference line now labelled "MEAN REF" (was "OB REF")
+//   • DRT trigger score default raised: 10 → 11 (fewer low-quality signals)
+//   • Raid + FVG memory defaults reduced: 120 → 90 bars (stale context avoided)
+//   • Level tolerance default tightened: 0.20 → 0.15 ATR
+//   • Retest proximity default tightened: 0.35 → 0.25 ATR
+//   • Retest cooldown default raised: 12 → 20 bars (no duplicate retest prints)
+//   • Displacement ATR default raised: 0.55 → 0.65 (higher impulse quality bar)
+//   • FVG memory default reduced: 80 → 60 bars
+//   • VWAP band multiplier default reduced: 2.0 → 1.75 (earlier band reaction)
+//   • High-volume multiplier default reduced: 1.5 → 1.3 (usable in quiet sessions)
+//   • Delta threshold default raised: 0.10 → 0.12 (noise reduction)
+//   • Signal cooldown default raised: 15 → 20 bars (less overtrading)
+//   • Sweep line cap reduced: 80 → 50
+//   • Exit/stop line cap reduced: 120 → 80
+//   • Pivot reference cap reduced: 12 → 8
+//   • Dashboard updated with mode label (DRT MODEL / LEGACY SCORE)
+//   • Dashboard hidden automatically in Execution Mode
+// =============================================================================
+
+indicator("SNAP ULTRA A+ HUB DEV 007", shorttitle = "SNAP A+ 007",
+          overlay          = true,
+          max_bars_back    = 500,
+          max_lines_count  = 500,
+          max_boxes_count  = 500,
+          max_labels_count = 500)
+
+// =============================================================================
+// EXECUTION MODE — top-level toggle (gating all heavy drawing objects)
+// =============================================================================
+var G_EXEC        = "⚡ Execution Mode"
+executionMode     = input.bool(false, "Execution Mode (Lightweight)",
+                   group   = G_EXEC,
+                   tooltip = "When ON: FVG boxes, sweep/exit/pivot lines, inefficiency zones, close-zone packs, and dashboard are all suppressed. Core signal calculations, BUY/SELL A+ labels, and kill-zone backgrounds remain active. Flip ON for live execution to reduce chart overhead.")
+
+// Derived gating boolean — all heavy drawing blocks check this
+showHeavyDrawings = not executionMode
+
+// =============================================================================
+// SESSIONS / KILL ZONES
+// =============================================================================
+var G_SESS     = "Sessions / Kill Zones"
+showKillZones  = input.bool(true,  "Show Kill Zone Backgrounds",      group = G_SESS)
+showNyKz       = input.bool(true,  "NY Kill Zone",                    group = G_SESS)
+showLondonKz   = input.bool(true,  "London Kill Zone",                group = G_SESS)
+showAsiaKz     = input.bool(false, "Asia Kill Zone",                  group = G_SESS)
+nyOpenStr      = input.session("0930-1130", "NY Open Session (server time)",     group = G_SESS)
+londonOpenStr  = input.session("0200-0500", "London Open Session (server time)", group = G_SESS)
+asiaOpenStr    = input.session("2000-2300", "Asia Open Session (server time)",   group = G_SESS)
+nyKzColor      = input.color(color.new(color.blue,   88), "NY KZ Colour",     group = G_SESS)
+londonKzColor  = input.color(color.new(color.yellow, 88), "London KZ Colour", group = G_SESS)
+asiaKzColor    = input.color(color.new(color.purple, 88), "Asia KZ Colour",   group = G_SESS)
+
+// =============================================================================
+// DRT CYCLE MODEL
+// =============================================================================
+var G_DRT        = "DRT Cycle Model"
+useDRTModel      = input.bool(true, "Use DRT Model (OFF = Legacy Score)",  group = G_DRT,
+                   tooltip = "ON: DRT cycle confluence path drives signals. OFF: legacy 10-point score path is used instead.")
+drtTriggerScore  = input.int(11,    "DRT Trigger Score (min)",
+                   minval = 6, maxval = 20, group = G_DRT,                  // DEV 007: 11 (was 10)
+                   tooltip = "Minimum DRT confluence score required for an A+ signal. Default 11 reduces noise vs DEV 006 default of 10.")
+drtRaidMemoryBars= input.int(90,    "Raid Memory (bars)",
+                   minval = 10, maxval = 500, group = G_DRT)                 // DEV 007: 90 (was 120)
+drtFvgMemoryBars = input.int(90,    "DRT FVG Memory (bars)",
+                   minval = 10, maxval = 500, group = G_DRT)                 // DEV 007: 90 (was 120)
+drtLevelTolAtr   = input.float(0.15, "Level Tolerance (ATR ×)",
+                   minval = 0.05, maxval = 1.0, step = 0.05, group = G_DRT, // DEV 007: 0.15 (was 0.20)
+                   tooltip = "Price must be within this ATR multiple of a DRT level to be considered aligned.")
+drtRetestProxAtr = input.float(0.25, "Retest Proximity (ATR ×)",
+                   minval = 0.05, maxval = 2.0, step = 0.05, group = G_DRT, // DEV 007: 0.25 (was 0.35)
+                   tooltip = "Price must be within this ATR multiple of the raid level to qualify as a retest.")
+drtRetestCooldown= input.int(20,    "Retest Cooldown (bars)",
+                   minval = 1, maxval = 100, group = G_DRT)                  // DEV 007: 20 (was 12)
+showDrtFvgBoxes  = input.bool(true, "Show DRT FVG Boxes",              group = G_DRT)
+showDrtIneffZones= input.bool(true, "Show DRT Inefficiency Zones",     group = G_DRT)
+showDrtLevels    = input.bool(true, "Show DRT Opening-Day Levels",     group = G_DRT)
+
+// =============================================================================
+// STRUCTURE / FVG
+// =============================================================================
+var G_STRUCT      = "Structure / FVG"
+swingLen          = input.int(10,    "Swing Pivot Length",
+                   minval = 3, maxval = 50, group = G_STRUCT)
+displacementAtr   = input.float(0.65, "Displacement ATR ×",
+                   minval = 0.3, maxval = 3.0, step = 0.05, group = G_STRUCT, // DEV 007: 0.65 (was 0.55)
+                   tooltip = "Minimum candle body size as multiple of ATR to qualify as displacement.")
+fvgMemoryBars     = input.int(60,   "FVG Memory (bars)",
+                   minval = 10, maxval = 300, group = G_STRUCT)                // DEV 007: 60 (was 80)
+showFvgBoxes      = input.bool(true, "Show Structure FVG Boxes",        group = G_STRUCT)
+showStructLabels  = input.bool(true, "Show HH / HL / LH / LL Labels",  group = G_STRUCT)
+showMssLabels     = input.bool(true, "Show MSS Labels",                 group = G_STRUCT)
+showRaidLabels    = input.bool(true, "Show Liquidity Raid Labels",      group = G_STRUCT)
+
+// =============================================================================
+// VALUE / VWAP
+// =============================================================================
+var G_VAL         = "Value / VWAP"
+useVwap           = input.bool(true,  "Use Session VWAP",               group = G_VAL)
+vwapBandMult      = input.float(1.75, "VWAP Band Multiplier (ATR ×)",
+                   minval = 0.5, maxval = 5.0, step = 0.05, group = G_VAL,  // DEV 007: 1.75 (was 2.0)
+                   tooltip = "ATR multiple used to project upper/lower VWAP deviation bands.")
+showVwapBands     = input.bool(true,  "Show VWAP Bands",                group = G_VAL)
+valueLen          = input.int(150,    "Range Look-back (bars)",
+                   minval = 20, maxval = 500, group = G_VAL)
+showPremDiscZones = input.bool(true,  "Show Premium / Discount Zones",  group = G_VAL)
+showDeviationPack = input.bool(true,  "Show Close-Zone / Deviation Pack", group = G_VAL,
+                   tooltip = "Shows the deviation extension from VWAP. Disabled in Execution Mode regardless of this setting.")
+
+// =============================================================================
+// EMA / RSI / FLOW
+// =============================================================================
+var G_FLOW        = "EMA / RSI / Flow"
+emaFast           = input.int(20,   "Fast EMA Length",   minval = 5,  maxval = 100, group = G_FLOW)
+emaSlow           = input.int(50,   "Slow EMA Length",   minval = 10, maxval = 300, group = G_FLOW)
+rsiLen            = input.int(14,   "RSI Length",        minval = 5,  maxval = 50,  group = G_FLOW)
+rsiObThresh       = input.int(60,   "RSI Bull Threshold",minval = 50, maxval = 80,  group = G_FLOW)
+rsiOsThresh       = input.int(40,   "RSI Bear Threshold",minval = 20, maxval = 50,  group = G_FLOW)
+highVolMult       = input.float(1.3, "High-Volume Multiplier",
+                   minval = 1.0, maxval = 3.0, step = 0.1, group = G_FLOW,  // DEV 007: 1.3 (was 1.5)
+                   tooltip = "Volume must exceed this × the 20-bar SMA to qualify as elevated.")
+deltaThreshold    = input.float(0.12, "Delta Flow Threshold",
+                   minval = 0.01, maxval = 0.5, step = 0.01, group = G_FLOW, // DEV 007: 0.12 (was 0.10)
+                   tooltip = "Minimum bar delta (close-body fraction of range) to confirm directional flow.")
+requireEmaForTrig = input.bool(true, "Require EMA Alignment (Legacy path)", group = G_FLOW)
+requireFlowForTrig= input.bool(true, "Require Flow Confirmation (Legacy path)", group = G_FLOW)
+
+// =============================================================================
+// SCORING / SIGNAL
+// =============================================================================
+var G_SCORE       = "Scoring / Signal"
+triggerScore      = input.int(10,   "Legacy A+ Score Threshold",
+                   minval = 4, maxval = 15, group = G_SCORE)
+aThresh           = input.int(7,    "A  Grade Threshold",
+                   minval = 3, maxval = 12, group = G_SCORE)
+apThresh          = input.int(9,    "A+ Grade Threshold",
+                   minval = 5, maxval = 15, group = G_SCORE)
+signalCooldownBars= input.int(20,   "Signal Cooldown (bars)",
+                   minval = 1, maxval = 200, group = G_SCORE,               // DEV 007: 20 (was 15)
+                   tooltip = "Minimum bars between consecutive BUY or SELL signals to avoid clustering.")
+
+// =============================================================================
+// VISUAL CONTROLS
+// =============================================================================
+var G_VIS         = "Visual Controls"
+showSweepLines    = input.bool(true,  "Show Sweep Logic Lines",          group = G_VIS)
+maxSweepLines     = input.int(50,     "Max Sweep Lines",
+                   minval = 5, maxval = 200, group = G_VIS)                 // DEV 007: 50 (was 80)
+showExitStopLines = input.bool(true,  "Show Exit / Stop Logic Lines",    group = G_VIS)
+maxExitStopLines  = input.int(80,     "Max Exit / Stop Lines",
+                   minval = 5, maxval = 300, group = G_VIS)                 // DEV 007: 80 (was 120)
+showPivotRefs     = input.bool(true,  "Show Pivot Reference Lines",      group = G_VIS)
+maxPivotRefs      = input.int(8,      "Max Pivot References",
+                   minval = 2, maxval = 50, group = G_VIS)                  // DEV 007: 8 (was 12)
+showSignalLabels  = input.bool(true,  "Show A+ Signal Labels",           group = G_VIS)
+showEntryRefLines = input.bool(true,  "Show ENTRY / MEAN REF Lines",     group = G_VIS)
+bullSigColor      = input.color(color.new(color.lime,  0), "Bull Signal Colour", group = G_VIS)
+bearSigColor      = input.color(color.new(color.red,   0), "Bear Signal Colour", group = G_VIS)
+
+// =============================================================================
+// DASHBOARD
+// =============================================================================
+var G_DASH        = "Dashboard"
+showDashboard     = input.bool(true, "Show Dashboard",  group = G_DASH,
+                   tooltip = "Dashboard is automatically hidden when Execution Mode is ON.")
+dashPosition      = input.string("Top Right", "Position",
+                   options  = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"],
+                   group    = G_DASH)
+
+// =============================================================================
+// COLOURS
+// =============================================================================
+C_BULL      = color.new(color.teal,     0)
+C_BEAR      = color.new(color.red,      0)
+C_PREM      = color.new(color.red,      85)
+C_DISC      = color.new(color.teal,     85)
+C_FVG_B     = color.new(color.teal,     80)
+C_FVG_S     = color.new(color.red,      80)
+C_LIQ       = color.new(color.orange,   0)
+C_DRT_FVG_B = color.new(color.aqua,     75)
+C_DRT_FVG_S = color.new(color.fuchsia,  75)
+C_DRT_INEFF = color.new(color.yellow,   80)
+C_DRT_LVL   = color.new(color.white,    30)
+C_ENTRY     = color.new(color.lime,     0)
+C_MEAN_REF  = color.new(color.orange,   0)
+C_STOP      = color.new(color.red,      0)
+C_A         = color.new(color.yellow,   0)
+C_APLUS     = color.new(color.lime,     0)
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+// Dashboard cell background highlight
+f_bg(cond) =>
+    cond ? color.new(color.teal, 40) : color.new(color.gray, 70)
+
+// Dashboard check / dash character
+f_tick(cond) =>
+    cond ? "✓" : "–"
+
+// Trim a line array to maxLen by deleting oldest entries
+f_trimLines(arr, maxLen) =>
+    while array.size(arr) > maxLen
+        line.delete(array.shift(arr))
+
+// Trim a label array to maxLen by deleting oldest entries
+f_trimLabels(arr, maxLen) =>
+    while array.size(arr) > maxLen
+        label.delete(array.shift(arr))
+
+// Trim a box array to maxLen by deleting oldest entries
+f_trimBoxes(arr, maxLen) =>
+    while array.size(arr) > maxLen
+        box.delete(array.shift(arr))
+
+// =============================================================================
+// SECTION 1 – OBSERVATION
+// =============================================================================
+
+// ── Volatility ───────────────────────────────────────────────────────────────
+atrVal   = ta.atr(14)
+
+// ── EMAs ─────────────────────────────────────────────────────────────────────
+emaF     = ta.ema(close, emaFast)
+emaS     = ta.ema(close, emaSlow)
+
+// ── RSI ──────────────────────────────────────────────────────────────────────
+rsiVal   = ta.rsi(close, rsiLen)
+
+// ── VWAP + deviation bands ────────────────────────────────────────────────────
+vwapVal  = ta.vwap
+vwapUp   = vwapVal + atrVal * vwapBandMult
+vwapDn   = vwapVal - atrVal * vwapBandMult
+
+// ── Volume / delta flow ────────────────────────────────────────────────────────
+volMa    = ta.sma(volume, 20)
+highVol  = volume > volMa * highVolMult
+
+// Bar delta: up-close fraction of candle range (proxy for order flow pressure)
+barRange  = high - low + atrVal * 0.01  // avoid div/0 on doji bars
+barBody   = math.abs(close - open)
+bullDelta = close > open ? barBody / barRange : 0.0
+bearDelta = close < open ? barBody / barRange : 0.0
+flowBull  = bullDelta >= deltaThreshold
+flowBear  = bearDelta >= deltaThreshold
+
+// ── Swing structure ───────────────────────────────────────────────────────────
+swingH   = ta.pivothigh(high, swingLen, swingLen)
+swingL   = ta.pivotlow (low,  swingLen, swingLen)
+
+var float prevSH     = na
+var float lastSH     = na
+var int   lastSHBar  = na
+var float prevSL     = na
+var float lastSL     = na
+var int   lastSLBar  = na
+
+if not na(swingH)
+    prevSH    := lastSH
+    lastSH    := swingH
+    lastSHBar := bar_index - swingLen
+
+if not na(swingL)
+    prevSL    := lastSL
+    lastSL    := swingL
+    lastSLBar := bar_index - swingLen
+
+// ── Rolling range (premium / discount reference) ──────────────────────────────
+rangeHi  = ta.highest(high, valueLen)
+rangeLo  = ta.lowest (low,  valueLen)
+rangeMid = math.avg(rangeHi, rangeLo)
+
+// ── Pivot history arrays (for capped pivot reference lines) ───────────────────
+var array<float> pivotHighPrices = array.new<float>()
+var array<int>   pivotHighBars   = array.new<int>()
+var array<float> pivotLowPrices  = array.new<float>()
+var array<int>   pivotLowBars    = array.new<int>()
+
+if not na(swingH)
+    array.push(pivotHighPrices, swingH)
+    array.push(pivotHighBars,   bar_index - swingLen)
+    while array.size(pivotHighPrices) > maxPivotRefs
+        array.shift(pivotHighPrices)
+        array.shift(pivotHighBars)
+
+if not na(swingL)
+    array.push(pivotLowPrices, swingL)
+    array.push(pivotLowBars,   bar_index - swingLen)
+    while array.size(pivotLowPrices) > maxPivotRefs
+        array.shift(pivotLowPrices)
+        array.shift(pivotLowBars)
+
+// =============================================================================
+// SECTION 2 – INTERPRETATION
+// =============================================================================
+
+// ── EMA trend / flow ──────────────────────────────────────────────────────────
+bullTrend   = emaF > emaS and close > emaS
+bearTrend   = emaF < emaS and close < emaS
+emaFlowBull = emaF > emaS and emaF > emaF[1]
+emaFlowBear = emaF < emaS and emaF < emaF[1]
+
+// ── Market structure pivots ───────────────────────────────────────────────────
+hh = not na(swingH) and not na(prevSH) and swingH > prevSH
+lh = not na(swingH) and not na(prevSH) and swingH < prevSH
+hl = not na(swingL) and not na(prevSL) and swingL > prevSL
+ll = not na(swingL) and not na(prevSL) and swingL < prevSL
+
+// ── Market Structure Shift (MSS) ──────────────────────────────────────────────
+mssBull = not na(lastSH) and ta.crossover (close, lastSH)
+mssBear = not na(lastSL) and ta.crossunder(close, lastSL)
+
+// ── Premium / Discount ────────────────────────────────────────────────────────
+inPremium  = close > rangeMid
+inDiscount = close < rangeMid
+
+// ── Liquidity build-up (equal highs / lows) ───────────────────────────────────
+eqTol      = 0.0003
+eqHigh     = not na(swingH) and not na(lastSH) and math.abs(swingH - lastSH) / lastSH <= eqTol
+eqLow      = not na(swingL) and not na(lastSL) and math.abs(swingL - lastSL) / lastSL <= eqTol
+buildingLiq = eqHigh or eqLow
+
+// ── Liquidity raids ───────────────────────────────────────────────────────────
+raidBull = not na(lastSL) and low < lastSL and close > lastSL
+raidBear = not na(lastSH) and high > lastSH and close < lastSH
+
+// ── Displacement ─────────────────────────────────────────────────────────────
+dispBull = close > open and barBody >= atrVal * displacementAtr and volume > volMa
+dispBear = close < open and barBody >= atrVal * displacementAtr and volume > volMa
+
+// ── Fair Value Gap (FVG / imbalance) ──────────────────────────────────────────
+fvgBull = high[2] < low[0]  and close[1] > open[1]
+fvgBear = low[2]  > high[0] and close[1] < open[1]
+
+// FVG memory arrays — track up to fvgMemoryBars worth of FVGs
+var array<float> fvgBullTop = array.new<float>()
+var array<float> fvgBullBot = array.new<float>()
+var array<int>   fvgBullBar = array.new<int>()
+var array<float> fvgBearTop = array.new<float>()
+var array<float> fvgBearBot = array.new<float>()
+var array<int>   fvgBearBar = array.new<int>()
+
+if fvgBull
+    array.push(fvgBullTop, low[0])
+    array.push(fvgBullBot, high[2])
+    array.push(fvgBullBar, bar_index)
+
+if fvgBear
+    array.push(fvgBearTop, low[2])
+    array.push(fvgBearBot, high[0])
+    array.push(fvgBearBar, bar_index)
+
+// Expire FVGs older than fvgMemoryBars
+while array.size(fvgBullBar) > 0 and bar_index - array.get(fvgBullBar, 0) > fvgMemoryBars
+    array.shift(fvgBullTop)
+    array.shift(fvgBullBot)
+    array.shift(fvgBullBar)
+
+while array.size(fvgBearBar) > 0 and bar_index - array.get(fvgBearBar, 0) > fvgMemoryBars
+    array.shift(fvgBearTop)
+    array.shift(fvgBearBot)
+    array.shift(fvgBearBar)
+
+// Is price retracing into any active FVG?
+inBullFvg = false
+nBullFvg  = array.size(fvgBullTop)
+if nBullFvg > 0
+    for i = 0 to nBullFvg - 1
+        if close >= array.get(fvgBullBot, i) and close <= array.get(fvgBullTop, i)
+            inBullFvg := true
+
+inBearFvg = false
+nBearFvg  = array.size(fvgBearTop)
+if nBearFvg > 0
+    for i = 0 to nBearFvg - 1
+        if close >= array.get(fvgBearBot, i) and close <= array.get(fvgBearTop, i)
+            inBearFvg := true
+
+// ── VWAP alignment ───────────────────────────────────────────────────────────
+vwapAlignBull = useVwap and close > vwapVal
+vwapAlignBear = useVwap and close < vwapVal
+vwapCrossBull = useVwap and ta.crossover (close, vwapVal)
+vwapCrossBear = useVwap and ta.crossunder(close, vwapVal)
+
+// RSI confluence
+rsiBull = rsiVal >= rsiObThresh
+rsiBear = rsiVal <= rsiOsThresh
+
+// =============================================================================
+// SECTION 3 – DRT CYCLE MODEL
+// =============================================================================
+// The DRT (Daily Range Trade) cycle:
+//   1. Day-open reference level is captured
+//   2. Intraday SSL/BSL raid is detected (with memory window)
+//   3. Post-raid displacement is tracked
+//   4. FVGs created after the raid are stored (DRT FVG memory)
+//   5. Price retesting the raid level → DRT retest opportunity
+//   6. All conditions scored → DRT A+ signal if threshold met
+
+// ── Day-open reference (captured on first bar of each new day) ────────────────
+isNewDay     = not na(time("D")) and (na(time("D")[1]) or time("D") != time("D")[1])
+var float drtOpenRef  = na
+var float drtHighRef  = na
+var float drtLowRef   = na
+var int   drtRefBar   = na
+
+if isNewDay
+    drtOpenRef := open
+    drtHighRef := high
+    drtLowRef  := low
+    drtRefBar  := bar_index
+
+// ── DRT raid detection (relative to day-open levels) ─────────────────────────
+drtInRange  = not na(drtRefBar) and (bar_index - drtRefBar) <= drtRaidMemoryBars
+drtRaidBull = drtInRange and not na(drtLowRef)  and low  < drtLowRef  and close > drtLowRef
+drtRaidBear = drtInRange and not na(drtHighRef) and high > drtHighRef and close < drtHighRef
+
+var float drtRaidLow     = na
+var float drtRaidHigh    = na
+var int   drtRaidBullBar = na
+var int   drtRaidBearBar = na
+
+if drtRaidBull
+    drtRaidLow     := low
+    drtRaidBullBar := bar_index
+if drtRaidBear
+    drtRaidHigh    := high
+    drtRaidBearBar := bar_index
+
+// Active windows: within drtRaidMemoryBars bars of the most recent raid
+drtRaidBullActive = not na(drtRaidBullBar) and (bar_index - drtRaidBullBar) <= drtRaidMemoryBars
+drtRaidBearActive = not na(drtRaidBearBar) and (bar_index - drtRaidBearBar) <= drtRaidMemoryBars
+
+// ── Post-raid displacement tracking ──────────────────────────────────────────
+// Set true on the displacement bar and kept true until next raid
+var bool drtPostRaidDispBull = false
+var bool drtPostRaidDispBear = false
+
+if drtRaidBull
+    drtPostRaidDispBull := false  // reset on new raid
+if drtRaidBear
+    drtPostRaidDispBear := false
+
+if dispBull and drtRaidBullActive
+    drtPostRaidDispBull := true
+if dispBear and drtRaidBearActive
+    drtPostRaidDispBear := true
+
+// ── DRT FVG memory (FVGs formed within the active raid window) ────────────────
+var array<float> drtFvgBullTop = array.new<float>()
+var array<float> drtFvgBullBot = array.new<float>()
+var array<int>   drtFvgBullBar = array.new<int>()
+var array<float> drtFvgBearTop = array.new<float>()
+var array<float> drtFvgBearBot = array.new<float>()
+var array<int>   drtFvgBearBar = array.new<int>()
+
+if fvgBull and drtRaidBullActive
+    array.push(drtFvgBullTop, low[0])
+    array.push(drtFvgBullBot, high[2])
+    array.push(drtFvgBullBar, bar_index)
+
+if fvgBear and drtRaidBearActive
+    array.push(drtFvgBearTop, low[2])
+    array.push(drtFvgBearBot, high[0])
+    array.push(drtFvgBearBar, bar_index)
+
+while array.size(drtFvgBullBar) > 0 and bar_index - array.get(drtFvgBullBar, 0) > drtFvgMemoryBars
+    array.shift(drtFvgBullTop)
+    array.shift(drtFvgBullBot)
+    array.shift(drtFvgBullBar)
+
+while array.size(drtFvgBearBar) > 0 and bar_index - array.get(drtFvgBearBar, 0) > drtFvgMemoryBars
+    array.shift(drtFvgBearTop)
+    array.shift(drtFvgBearBot)
+    array.shift(drtFvgBearBar)
+
+// Is price retracing into a DRT FVG?
+inDrtFvgBull = false
+nDrtBullFvg  = array.size(drtFvgBullTop)
+if nDrtBullFvg > 0
+    for i = 0 to nDrtBullFvg - 1
+        if close >= array.get(drtFvgBullBot, i) and close <= array.get(drtFvgBullTop, i)
+            inDrtFvgBull := true
+
+inDrtFvgBear = false
+nDrtBearFvg  = array.size(drtFvgBearTop)
+if nDrtBearFvg > 0
+    for i = 0 to nDrtBearFvg - 1
+        if close >= array.get(drtFvgBearBot, i) and close <= array.get(drtFvgBearTop, i)
+            inDrtFvgBear := true
+
+// ── DRT retest proximity ──────────────────────────────────────────────────────
+drtRetestTol  = atrVal * drtRetestProxAtr
+drtRetestBull = drtRaidBullActive and not na(drtRaidLow)  and math.abs(close - drtRaidLow)  <= drtRetestTol
+drtRetestBear = drtRaidBearActive and not na(drtRaidHigh) and math.abs(close - drtRaidHigh) <= drtRetestTol
+
+// ── DRT close-zone (price near day-open reference within level tolerance) ──────
+drtLevelTol       = atrVal * drtLevelTolAtr
+drtCloseZoneBull  = not na(drtOpenRef) and close > drtOpenRef and math.abs(close - drtOpenRef) <= drtLevelTol
+drtCloseZoneBear  = not na(drtOpenRef) and close < drtOpenRef and math.abs(close - drtOpenRef) <= drtLevelTol
+
+// ── DRT retest cooldown tracking ──────────────────────────────────────────────
+var int lastDrtRetestBullBar = na
+var int lastDrtRetestBearBar = na
+
+drtRetestBullReady = na(lastDrtRetestBullBar) or (bar_index - lastDrtRetestBullBar) > drtRetestCooldown
+drtRetestBearReady = na(lastDrtRetestBearBar) or (bar_index - lastDrtRetestBearBar) > drtRetestCooldown
+
+// ── DRT confluence score (max 15 points) ─────────────────────────────────────
+// Weighted: raid (2), post-raid displacement (2), DRT FVG (2)
+// Unweighted (1 each): retest, close-zone, EMA trend/flow, premium/discount, MSS, VWAP, delta, volume, RSI
+drtScoreBull = (drtRaidBullActive    ? 2 : 0)
+             + (drtPostRaidDispBull  ? 2 : 0)
+             + (inDrtFvgBull         ? 2 : 0)
+             + (drtRetestBull        ? 1 : 0)
+             + (drtCloseZoneBull     ? 1 : 0)
+             + (bullTrend            ? 1 : 0)
+             + (emaFlowBull          ? 1 : 0)
+             + (inDiscount           ? 1 : 0)
+             + (mssBull              ? 1 : 0)
+             + (vwapAlignBull        ? 1 : 0)
+             + (flowBull             ? 1 : 0)
+             + (highVol              ? 1 : 0)
+             + (rsiBull              ? 1 : 0)
+
+drtScoreBear = (drtRaidBearActive    ? 2 : 0)
+             + (drtPostRaidDispBear  ? 2 : 0)
+             + (inDrtFvgBear         ? 2 : 0)
+             + (drtRetestBear        ? 1 : 0)
+             + (drtCloseZoneBear     ? 1 : 0)
+             + (bearTrend            ? 1 : 0)
+             + (emaFlowBear          ? 1 : 0)
+             + (inPremium            ? 1 : 0)
+             + (mssBear              ? 1 : 0)
+             + (vwapAlignBear        ? 1 : 0)
+             + (flowBear             ? 1 : 0)
+             + (highVol              ? 1 : 0)
+             + (rsiBear              ? 1 : 0)
+
+// ── DRT A+ core conditions ────────────────────────────────────────────────────
+drtBuyAPlusCore  = drtScoreBull >= drtTriggerScore and drtRetestBull and drtRetestBullReady
+drtSellAPlusCore = drtScoreBear >= drtTriggerScore and drtRetestBear and drtRetestBearReady
+
+// =============================================================================
+// SECTION 4 – LEGACY SCORE PATH (12-point maximum)
+// =============================================================================
+scoreBull = (bullTrend     ? 1 : 0)
+          + (emaFlowBull   ? 1 : 0)
+          + (inDiscount    ? 1 : 0)
+          + (raidBull      ? 1 : 0)
+          + (mssBull       ? 1 : 0)
+          + (dispBull      ? 1 : 0)
+          + (inBullFvg     ? 1 : 0)
+          + (vwapAlignBull ? 1 : 0)
+          + (hl            ? 1 : 0)
+          + (highVol       ? 1 : 0)
+          + (flowBull      ? 1 : 0)
+          + (rsiBull       ? 1 : 0)
+
+scoreBear = (bearTrend     ? 1 : 0)
+          + (emaFlowBear   ? 1 : 0)
+          + (inPremium     ? 1 : 0)
+          + (raidBear      ? 1 : 0)
+          + (mssBear       ? 1 : 0)
+          + (dispBear      ? 1 : 0)
+          + (inBearFvg     ? 1 : 0)
+          + (vwapAlignBear ? 1 : 0)
+          + (lh            ? 1 : 0)
+          + (highVol       ? 1 : 0)
+          + (flowBear      ? 1 : 0)
+          + (rsiBear       ? 1 : 0)
+
+isABull      = scoreBull >= aThresh
+isAplusBull  = scoreBull >= apThresh
+isABear      = scoreBear >= aThresh
+isAplusBear  = scoreBear >= apThresh
+
+legacyBuyTrigger  = isAplusBull and dispBull
+                    and (not requireEmaForTrig  or bullTrend)
+                    and (not requireFlowForTrig or flowBull)
+
+legacySellTrigger = isAplusBear and dispBear
+                    and (not requireEmaForTrig  or bearTrend)
+                    and (not requireFlowForTrig or flowBear)
+
+// =============================================================================
+// SECTION 5 – SIGNAL GENERATION (cooldown applied)
+// =============================================================================
+rawBuySignal  = useDRTModel ? drtBuyAPlusCore  : legacyBuyTrigger
+rawSellSignal = useDRTModel ? drtSellAPlusCore : legacySellTrigger
+
+var int lastBuyBar  = na
+var int lastSellBar = na
+
+buyCoolOk  = na(lastBuyBar)  or (bar_index - lastBuyBar)  > signalCooldownBars
+sellCoolOk = na(lastSellBar) or (bar_index - lastSellBar) > signalCooldownBars
+
+buySignal  = rawBuySignal  and buyCoolOk
+sellSignal = rawSellSignal and sellCoolOk
+
+if buySignal
+    lastBuyBar           := bar_index
+    lastDrtRetestBullBar := bar_index
+
+if sellSignal
+    lastSellBar          := bar_index
+    lastDrtRetestBearBar := bar_index
+
+// =============================================================================
+// SECTION 6 – COMMUNICATION
+// =============================================================================
+
+// ── 6.1  Kill zone backgrounds (lightweight-safe — available in execution mode)
+isNyKz     = showKillZones and showNyKz     and not na(time(timeframe.period, nyOpenStr))
+isLondonKz = showKillZones and showLondonKz and not na(time(timeframe.period, londonOpenStr))
+isAsiaKz   = showKillZones and showAsiaKz   and not na(time(timeframe.period, asiaOpenStr))
+
+bgcolor(isNyKz     ? nyKzColor     : na, title = "NY Kill Zone")
+bgcolor(isLondonKz ? londonKzColor : na, title = "London Kill Zone")
+bgcolor(isAsiaKz   ? asiaKzColor   : na, title = "Asia Kill Zone")
+
+// ── 6.2  Core indicator line plots (lightweight-safe) ────────────────────────
+plot(emaF, "Fast EMA",
+     color = color.new(color.blue, 0), linewidth = 1)
+plot(emaS, "Slow EMA",
+     color = color.new(color.orange, 0), linewidth = 1)
+plot(useVwap ? vwapVal : na, "VWAP",
+     color = color.new(color.purple, 0), linewidth = 1, style = plot.style_circles)
+
+// VWAP bands — gated by showHeavyDrawings for execution mode
+plot(useVwap and showVwapBands and showHeavyDrawings ? vwapUp : na,
+     "VWAP Upper Band", color = color.new(color.purple, 60), linewidth = 1)
+plot(useVwap and showVwapBands and showHeavyDrawings ? vwapDn : na,
+     "VWAP Lower Band", color = color.new(color.purple, 60), linewidth = 1)
+
+// ── 6.3  Structure labels (HH / HL / LH / LL) — gated ───────────────────────
+if showStructLabels and showHeavyDrawings and not na(swingH)
+    label.new(bar_index - swingLen, swingH,
+              hh ? "HH" : "LH",
+              style     = label.style_label_down,
+              color     = hh ? C_BULL : C_BEAR,
+              textcolor = color.white,
+              size      = size.small)
+
+if showStructLabels and showHeavyDrawings and not na(swingL)
+    label.new(bar_index - swingLen, swingL,
+              hl ? "HL" : "LL",
+              style     = label.style_label_up,
+              color     = hl ? C_BULL : C_BEAR,
+              textcolor = color.white,
+              size      = size.small)
+
+// ── 6.4  Raid labels — gated ──────────────────────────────────────────────────
+if showRaidLabels and showHeavyDrawings and raidBull
+    label.new(bar_index, low, "RAID ↑\nSSL Swept",
+              style     = label.style_label_up,
+              color     = C_BULL,
+              textcolor = color.white,
+              size      = size.small)
+
+if showRaidLabels and showHeavyDrawings and raidBear
+    label.new(bar_index, high, "RAID ↓\nBSL Swept",
+              style     = label.style_label_down,
+              color     = C_BEAR,
+              textcolor = color.white,
+              size      = size.small)
+
+// ── 6.5  MSS labels — gated ───────────────────────────────────────────────────
+if showMssLabels and showHeavyDrawings and mssBull
+    label.new(bar_index, low, "MSS ↑",
+              style     = label.style_label_up,
+              color     = C_BULL,
+              textcolor = color.white,
+              size      = size.small)
+
+if showMssLabels and showHeavyDrawings and mssBear
+    label.new(bar_index, high, "MSS ↓",
+              style     = label.style_label_down,
+              color     = C_BEAR,
+              textcolor = color.white,
+              size      = size.small)
+
+// ── 6.6  Structure FVG reference boxes — gated, capped ───────────────────────
+var array<box> fvgBoxes = array.new<box>()
+
+if showFvgBoxes and showHeavyDrawings and fvgBull
+    b = box.new(bar_index - 2, low[0], bar_index + fvgMemoryBars, high[2],
+                border_color = C_FVG_B, bgcolor = C_FVG_B, border_width = 1)
+    array.push(fvgBoxes, b)
+    f_trimBoxes(fvgBoxes, 50)
+
+if showFvgBoxes and showHeavyDrawings and fvgBear
+    b = box.new(bar_index - 2, low[2], bar_index + fvgMemoryBars, high[0],
+                border_color = C_FVG_S, bgcolor = C_FVG_S, border_width = 1)
+    array.push(fvgBoxes, b)
+    f_trimBoxes(fvgBoxes, 50)
+
+// ── 6.7  DRT FVG boxes — gated, capped ───────────────────────────────────────
+var array<box> drtFvgBoxes = array.new<box>()
+
+if showDrtFvgBoxes and showHeavyDrawings and fvgBull and drtRaidBullActive
+    b = box.new(bar_index - 2, low[0], bar_index + drtFvgMemoryBars, high[2],
+                border_color = C_DRT_FVG_B, bgcolor = C_DRT_FVG_B, border_width = 2)
+    array.push(drtFvgBoxes, b)
+    f_trimBoxes(drtFvgBoxes, 20)
+
+if showDrtFvgBoxes and showHeavyDrawings and fvgBear and drtRaidBearActive
+    b = box.new(bar_index - 2, low[2], bar_index + drtFvgMemoryBars, high[0],
+                border_color = C_DRT_FVG_S, bgcolor = C_DRT_FVG_S, border_width = 2)
+    array.push(drtFvgBoxes, b)
+    f_trimBoxes(drtFvgBoxes, 20)
+
+// ── 6.8  DRT inefficiency zone (raid-to-displacement range) — gated ──────────
+var array<box> drtIneffBoxes = array.new<box>()
+
+if showDrtIneffZones and showHeavyDrawings and drtPostRaidDispBull and not drtPostRaidDispBull[1]
+    // New post-raid bullish displacement — draw inefficiency zone
+    if not na(drtRaidLow) and not na(drtRaidBullBar)
+        b = box.new(drtRaidBullBar, close, bar_index, drtRaidLow,
+                    border_color = C_DRT_INEFF, bgcolor = C_DRT_INEFF, border_width = 1)
+        array.push(drtIneffBoxes, b)
+        f_trimBoxes(drtIneffBoxes, 10)
+
+if showDrtIneffZones and showHeavyDrawings and drtPostRaidDispBear and not drtPostRaidDispBear[1]
+    if not na(drtRaidHigh) and not na(drtRaidBearBar)
+        b = box.new(drtRaidBearBar, drtRaidHigh, bar_index, close,
+                    border_color = C_DRT_INEFF, bgcolor = C_DRT_INEFF, border_width = 1)
+        array.push(drtIneffBoxes, b)
+        f_trimBoxes(drtIneffBoxes, 10)
+
+// ── 6.9  Premium / Discount zone boxes — gated ───────────────────────────────
+var box boxPrem = na
+var box boxDisc = na
+
+if showPremDiscZones and showHeavyDrawings and barstate.islast
+    box.delete(boxPrem)
+    box.delete(boxDisc)
+    boxPrem := box.new(bar_index - valueLen, rangeHi, bar_index, rangeMid,
+                       border_color = C_PREM, bgcolor = C_PREM, border_width = 1)
+    boxDisc := box.new(bar_index - valueLen, rangeMid, bar_index, rangeLo,
+                       border_color = C_DISC, bgcolor = C_DISC, border_width = 1)
+
+// ── 6.10  Sweep logic lines (raid level markers) — gated, capped ─────────────
+var array<line> sweepLines = array.new<line>()
+
+if showSweepLines and showHeavyDrawings
+    if raidBull and not na(lastSL) and not na(lastSLBar)
+        l = line.new(lastSLBar, lastSL, bar_index, lastSL,
+                     color = C_LIQ, style = line.style_dashed, width = 1)
+        array.push(sweepLines, l)
+        f_trimLines(sweepLines, maxSweepLines)
+    if raidBear and not na(lastSH) and not na(lastSHBar)
+        l = line.new(lastSHBar, lastSH, bar_index, lastSH,
+                     color = C_LIQ, style = line.style_dashed, width = 1)
+        array.push(sweepLines, l)
+        f_trimLines(sweepLines, maxSweepLines)
+
+// ── 6.11  Pivot reference lines (BSL / SSL) — gated, capped, redrawn on islast
+var array<line>  pivotRefLines  = array.new<line>()
+var array<label> pivotRefLabels = array.new<label>()
+
+if showPivotRefs and showHeavyDrawings and barstate.islast
+    // Delete all previous pivot reference drawings
+    nPL = array.size(pivotRefLines)
+    if nPL > 0
+        for i = 0 to nPL - 1
+            line.delete(array.get(pivotRefLines, i))
+    array.clear(pivotRefLines)
+
+    nPLb = array.size(pivotRefLabels)
+    if nPLb > 0
+        for i = 0 to nPLb - 1
+            label.delete(array.get(pivotRefLabels, i))
+    array.clear(pivotRefLabels)
+
+    // Draw the N most recent swing highs (BSL)
+    nHigh = array.size(pivotHighPrices)
+    if nHigh > 0
+        for i = 0 to nHigh - 1
+            ph  = array.get(pivotHighPrices, i)
+            phb = array.get(pivotHighBars,   i)
+            pl  = line.new(phb, ph, bar_index, ph,
+                           color  = C_LIQ,
+                           style  = line.style_dotted,
+                           width  = 1,
+                           extend = extend.right)
+            lbl = label.new(bar_index, ph, "BSL",
+                            style     = label.style_label_left,
+                            color     = C_LIQ,
+                            textcolor = color.black,
+                            size      = size.tiny)
+            array.push(pivotRefLines,  pl)
+            array.push(pivotRefLabels, lbl)
+
+    // Draw the N most recent swing lows (SSL)
+    nLow = array.size(pivotLowPrices)
+    if nLow > 0
+        for i = 0 to nLow - 1
+            pl_v = array.get(pivotLowPrices, i)
+            pl_b = array.get(pivotLowBars,   i)
+            l2   = line.new(pl_b, pl_v, bar_index, pl_v,
+                            color  = C_LIQ,
+                            style  = line.style_dotted,
+                            width  = 1,
+                            extend = extend.right)
+            lbl2 = label.new(bar_index, pl_v, "SSL",
+                             style     = label.style_label_left,
+                             color     = C_LIQ,
+                             textcolor = color.black,
+                             size      = size.tiny)
+            array.push(pivotRefLines,  l2)
+            array.push(pivotRefLabels, lbl2)
+
+// ── 6.12  DRT opening-day level lines — gated ─────────────────────────────────
+var line drtOpenLine = na
+var line drtHighLine = na
+var line drtLowLine  = na
+var label drtOpenLbl = na
+var label drtHighLbl = na
+var label drtLowLbl  = na
+
+if showDrtLevels and showHeavyDrawings and isNewDay
+    line.delete(drtOpenLine)
+    line.delete(drtHighLine)
+    line.delete(drtLowLine)
+    label.delete(drtOpenLbl)
+    label.delete(drtHighLbl)
+    label.delete(drtLowLbl)
+
+    drtOpenLine := line.new(bar_index, open, bar_index, open,
+                            color  = C_DRT_LVL,
+                            style  = line.style_solid,
+                            width  = 1,
+                            extend = extend.right)
+    drtHighLine := line.new(bar_index, high, bar_index, high,
+                            color  = C_DRT_LVL,
+                            style  = line.style_dotted,
+                            width  = 1,
+                            extend = extend.right)
+    drtLowLine  := line.new(bar_index, low, bar_index, low,
+                            color  = C_DRT_LVL,
+                            style  = line.style_dotted,
+                            width  = 1,
+                            extend = extend.right)
+    drtOpenLbl  := label.new(bar_index, open, "DRT OPEN",
+                             style = label.style_label_right,
+                             color = C_DRT_LVL, textcolor = color.black, size = size.tiny)
+    drtHighLbl  := label.new(bar_index, high, "DRT HIGH",
+                             style = label.style_label_right,
+                             color = C_DRT_LVL, textcolor = color.black, size = size.tiny)
+    drtLowLbl   := label.new(bar_index, low, "DRT LOW",
+                             style = label.style_label_right,
+                             color = C_DRT_LVL, textcolor = color.black, size = size.tiny)
+
+// ── 6.13  A+ Signal Labels — ENTRY + MEAN REF lines (essential, always visible)
+// Signal triangle plotshapes (lightweight — below/above bar markers)
+plotshape(buySignal,  "A+ BUY",  shape.triangleup,   location.belowbar, bullSigColor, size = size.small)
+plotshape(sellSignal, "A+ SELL", shape.triangledown,  location.abovebar, bearSigColor, size = size.small)
+
+// A+ label with score (shown when showSignalLabels is ON regardless of execution mode)
+if showSignalLabels and buySignal
+    sigScore = useDRTModel ? drtScoreBull : scoreBull
+    modeTag  = useDRTModel ? "DRT " : ""
+    label.new(bar_index, low,
+              "A+ BUY\n" + modeTag + str.tostring(sigScore),
+              style     = label.style_label_up,
+              color     = bullSigColor,
+              textcolor = color.black,
+              size      = size.normal)
+
+if showSignalLabels and sellSignal
+    sigScore = useDRTModel ? drtScoreBear : scoreBear
+    modeTag  = useDRTModel ? "DRT " : ""
+    label.new(bar_index, high,
+              "A+ SELL\n" + modeTag + str.tostring(sigScore),
+              style     = label.style_label_down,
+              color     = bearSigColor,
+              textcolor = color.black,
+              size      = size.normal)
+
+// ENTRY and MEAN REF reference lines (labels corrected from DEV 006 "SWEEP"/"OB REF")
+// These lines extend right for visual reference and are replaced on next signal
+var line entryLineBuy   = na
+var line meanRefLineBuy = na
+var line entryLineSell  = na
+var line meanRefLineSell= na
+
+if showEntryRefLines and buySignal
+    line.delete(entryLineBuy)
+    line.delete(meanRefLineBuy)
+    entryLineBuy   := line.new(bar_index, close, bar_index, close,
+                               color  = C_ENTRY,
+                               style  = line.style_solid,
+                               width  = 2,
+                               extend = extend.right)
+    meanRefLineBuy := line.new(bar_index, vwapVal, bar_index, vwapVal,
+                               color  = C_MEAN_REF,
+                               style  = line.style_dashed,
+                               width  = 1,
+                               extend = extend.right)
+    // ENTRY label (correct naming — DEV 007 fix)
+    label.new(bar_index, close, "ENTRY",
+              style     = label.style_label_right,
+              color     = C_ENTRY,
+              textcolor = color.black,
+              size      = size.tiny)
+    // MEAN REF label (correct naming — DEV 007 fix)
+    label.new(bar_index, vwapVal, "MEAN REF",
+              style     = label.style_label_right,
+              color     = C_MEAN_REF,
+              textcolor = color.black,
+              size      = size.tiny)
+
+if showEntryRefLines and sellSignal
+    line.delete(entryLineSell)
+    line.delete(meanRefLineSell)
+    entryLineSell   := line.new(bar_index, close, bar_index, close,
+                                color  = bearSigColor,
+                                style  = line.style_solid,
+                                width  = 2,
+                                extend = extend.right)
+    meanRefLineSell := line.new(bar_index, vwapVal, bar_index, vwapVal,
+                                color  = C_MEAN_REF,
+                                style  = line.style_dashed,
+                                width  = 1,
+                                extend = extend.right)
+    label.new(bar_index, close, "ENTRY",
+              style     = label.style_label_right,
+              color     = bearSigColor,
+              textcolor = color.black,
+              size      = size.tiny)
+    label.new(bar_index, vwapVal, "MEAN REF",
+              style     = label.style_label_right,
+              color     = C_MEAN_REF,
+              textcolor = color.black,
+              size      = size.tiny)
+
+// ── 6.14  Exit / Stop logic lines — gated, capped ─────────────────────────────
+var array<line> exitLines = array.new<line>()
+
+if showExitStopLines and showHeavyDrawings and buySignal
+    stopLvl  = close - atrVal * 1.5
+    target1  = close + atrVal * 2.0
+    lStop    = line.new(bar_index, stopLvl, bar_index, stopLvl,
+                        color  = C_STOP,
+                        style  = line.style_dashed,
+                        width  = 1,
+                        extend = extend.right)
+    lTarget  = line.new(bar_index, target1, bar_index, target1,
+                        color  = C_BULL,
+                        style  = line.style_dashed,
+                        width  = 1,
+                        extend = extend.right)
+    array.push(exitLines, lStop)
+    array.push(exitLines, lTarget)
+    f_trimLines(exitLines, maxExitStopLines)
+
+if showExitStopLines and showHeavyDrawings and sellSignal
+    stopLvl  = close + atrVal * 1.5
+    target1  = close - atrVal * 2.0
+    lStop    = line.new(bar_index, stopLvl, bar_index, stopLvl,
+                        color  = C_STOP,
+                        style  = line.style_dashed,
+                        width  = 1,
+                        extend = extend.right)
+    lTarget  = line.new(bar_index, target1, bar_index, target1,
+                        color  = C_BEAR,
+                        style  = line.style_dashed,
+                        width  = 1,
+                        extend = extend.right)
+    array.push(exitLines, lStop)
+    array.push(exitLines, lTarget)
+    f_trimLines(exitLines, maxExitStopLines)
+
+// ── 6.15  Dashboard — hidden in Execution Mode ────────────────────────────────
+dashPos  = dashPosition == "Top Right"    ? position.top_right    :
+           dashPosition == "Top Left"     ? position.top_left     :
+           dashPosition == "Bottom Right" ? position.bottom_right :
+           position.bottom_left
+
+var table dash = table.new(dashPos, 3, 20,
+                           bgcolor      = color.new(color.black, 55),
+                           border_width = 1,
+                           border_color = color.new(color.white, 70))
+
+showDash = showDashboard and not executionMode
+
+if showDash and barstate.islast
+
+    // ── Header row ────────────────────────────────────────────────────────────
+    table.cell(dash, 0, 0, "SNAP ULTRA A+ HUB DEV 007",
+               text_color = color.white,
+               bgcolor    = color.new(color.navy, 10),
+               text_size  = size.small)
+    table.cell(dash, 1, 0, "BULL",
+               text_color = color.teal,
+               bgcolor    = color.new(color.navy, 10),
+               text_size  = size.small)
+    table.cell(dash, 2, 0, "BEAR",
+               text_color = color.red,
+               bgcolor    = color.new(color.navy, 10),
+               text_size  = size.small)
+
+    // ── Mode row ──────────────────────────────────────────────────────────────
+    modeStr = useDRTModel ? "DRT MODEL" : "LEGACY SCORE"
+    table.cell(dash, 0, 1, "Mode: " + modeStr,
+               text_color = color.yellow,
+               bgcolor    = color.new(color.navy, 25),
+               text_size  = size.tiny)
+    table.cell(dash, 1, 1, "",
+               bgcolor = color.new(color.navy, 25), text_size = size.tiny)
+    table.cell(dash, 2, 1, "",
+               bgcolor = color.new(color.navy, 25), text_size = size.tiny)
+
+    // ── Market state rows ─────────────────────────────────────────────────────
+    table.cell(dash, 0,  2, "EMA Trend",
+               text_color = color.white, bgcolor = f_bg(bullTrend or bearTrend), text_size = size.small)
+    table.cell(dash, 1,  2, f_tick(bullTrend),
+               text_color = color.white, bgcolor = f_bg(bullTrend),  text_size = size.small)
+    table.cell(dash, 2,  2, f_tick(bearTrend),
+               text_color = color.white, bgcolor = f_bg(bearTrend),  text_size = size.small)
+
+    table.cell(dash, 0,  3, "EMA Flow",
+               text_color = color.white, bgcolor = f_bg(emaFlowBull or emaFlowBear), text_size = size.small)
+    table.cell(dash, 1,  3, f_tick(emaFlowBull),
+               text_color = color.white, bgcolor = f_bg(emaFlowBull), text_size = size.small)
+    table.cell(dash, 2,  3, f_tick(emaFlowBear),
+               text_color = color.white, bgcolor = f_bg(emaFlowBear), text_size = size.small)
+
+    table.cell(dash, 0,  4, "Liquidity Raid",
+               text_color = color.white, bgcolor = f_bg(raidBull or raidBear), text_size = size.small)
+    table.cell(dash, 1,  4, f_tick(raidBull),
+               text_color = color.white, bgcolor = f_bg(raidBull), text_size = size.small)
+    table.cell(dash, 2,  4, f_tick(raidBear),
+               text_color = color.white, bgcolor = f_bg(raidBear), text_size = size.small)
+
+    table.cell(dash, 0,  5, "DRT Raid",
+               text_color = color.white, bgcolor = f_bg(drtRaidBull or drtRaidBear), text_size = size.small)
+    table.cell(dash, 1,  5, f_tick(drtRaidBullActive),
+               text_color = color.white, bgcolor = f_bg(drtRaidBullActive), text_size = size.small)
+    table.cell(dash, 2,  5, f_tick(drtRaidBearActive),
+               text_color = color.white, bgcolor = f_bg(drtRaidBearActive), text_size = size.small)
+
+    table.cell(dash, 0,  6, "DRT Displacement",
+               text_color = color.white, bgcolor = f_bg(drtPostRaidDispBull or drtPostRaidDispBear), text_size = size.small)
+    table.cell(dash, 1,  6, f_tick(drtPostRaidDispBull),
+               text_color = color.white, bgcolor = f_bg(drtPostRaidDispBull), text_size = size.small)
+    table.cell(dash, 2,  6, f_tick(drtPostRaidDispBear),
+               text_color = color.white, bgcolor = f_bg(drtPostRaidDispBear), text_size = size.small)
+
+    table.cell(dash, 0,  7, "MSS",
+               text_color = color.white, bgcolor = f_bg(mssBull or mssBear), text_size = size.small)
+    table.cell(dash, 1,  7, f_tick(mssBull),
+               text_color = color.white, bgcolor = f_bg(mssBull), text_size = size.small)
+    table.cell(dash, 2,  7, f_tick(mssBear),
+               text_color = color.white, bgcolor = f_bg(mssBear), text_size = size.small)
+
+    table.cell(dash, 0,  8, "Displacement",
+               text_color = color.white, bgcolor = f_bg(dispBull or dispBear), text_size = size.small)
+    table.cell(dash, 1,  8, f_tick(dispBull),
+               text_color = color.white, bgcolor = f_bg(dispBull), text_size = size.small)
+    table.cell(dash, 2,  8, f_tick(dispBear),
+               text_color = color.white, bgcolor = f_bg(dispBear), text_size = size.small)
+
+    table.cell(dash, 0,  9, "Prem / Disc",
+               text_color = color.white, bgcolor = f_bg(inPremium or inDiscount), text_size = size.small)
+    table.cell(dash, 1,  9, f_tick(inDiscount) + " DISC",
+               text_color = color.white, bgcolor = f_bg(inDiscount), text_size = size.small)
+    table.cell(dash, 2,  9, f_tick(inPremium) + " PREM",
+               text_color = color.white, bgcolor = f_bg(inPremium),  text_size = size.small)
+
+    table.cell(dash, 0, 10, "FVG Retrace",
+               text_color = color.white, bgcolor = f_bg(inBullFvg or inBearFvg), text_size = size.small)
+    table.cell(dash, 1, 10, f_tick(inBullFvg),
+               text_color = color.white, bgcolor = f_bg(inBullFvg), text_size = size.small)
+    table.cell(dash, 2, 10, f_tick(inBearFvg),
+               text_color = color.white, bgcolor = f_bg(inBearFvg), text_size = size.small)
+
+    table.cell(dash, 0, 11, "DRT FVG",
+               text_color = color.white, bgcolor = f_bg(inDrtFvgBull or inDrtFvgBear), text_size = size.small)
+    table.cell(dash, 1, 11, f_tick(inDrtFvgBull),
+               text_color = color.white, bgcolor = f_bg(inDrtFvgBull), text_size = size.small)
+    table.cell(dash, 2, 11, f_tick(inDrtFvgBear),
+               text_color = color.white, bgcolor = f_bg(inDrtFvgBear), text_size = size.small)
+
+    table.cell(dash, 0, 12, "DRT Retest",
+               text_color = color.white, bgcolor = f_bg(drtRetestBull or drtRetestBear), text_size = size.small)
+    table.cell(dash, 1, 12, f_tick(drtRetestBull),
+               text_color = color.white, bgcolor = f_bg(drtRetestBull), text_size = size.small)
+    table.cell(dash, 2, 12, f_tick(drtRetestBear),
+               text_color = color.white, bgcolor = f_bg(drtRetestBear), text_size = size.small)
+
+    table.cell(dash, 0, 13, "VWAP Align",
+               text_color = color.white, bgcolor = f_bg(vwapAlignBull or vwapAlignBear), text_size = size.small)
+    table.cell(dash, 1, 13, f_tick(vwapAlignBull),
+               text_color = color.white, bgcolor = f_bg(vwapAlignBull), text_size = size.small)
+    table.cell(dash, 2, 13, f_tick(vwapAlignBear),
+               text_color = color.white, bgcolor = f_bg(vwapAlignBear), text_size = size.small)
+
+    table.cell(dash, 0, 14, "Delta Flow",
+               text_color = color.white, bgcolor = f_bg(flowBull or flowBear), text_size = size.small)
+    table.cell(dash, 1, 14, f_tick(flowBull),
+               text_color = color.white, bgcolor = f_bg(flowBull), text_size = size.small)
+    table.cell(dash, 2, 14, f_tick(flowBear),
+               text_color = color.white, bgcolor = f_bg(flowBear), text_size = size.small)
+
+    table.cell(dash, 0, 15, "High Volume",
+               text_color = color.white, bgcolor = f_bg(highVol), text_size = size.small)
+    table.cell(dash, 1, 15, f_tick(highVol),
+               text_color = color.white, bgcolor = f_bg(highVol), text_size = size.small)
+    table.cell(dash, 2, 15, f_tick(highVol),
+               text_color = color.white, bgcolor = f_bg(highVol), text_size = size.small)
+
+    // ── Score row ─────────────────────────────────────────────────────────────
+    scoreLabel = useDRTModel ? "DRT Score (/ 15)" : "Score (/ 12)"
+    dispBull2  = useDRTModel ? drtScoreBull : scoreBull
+    dispBear2  = useDRTModel ? drtScoreBear : scoreBear
+    table.cell(dash, 0, 16, scoreLabel,
+               text_color = color.white,  bgcolor = color.new(color.navy, 25), text_size = size.small)
+    table.cell(dash, 1, 16, str.tostring(dispBull2),
+               text_color = color.yellow, bgcolor = color.new(color.navy, 25), text_size = size.small)
+    table.cell(dash, 2, 16, str.tostring(dispBear2),
+               text_color = color.yellow, bgcolor = color.new(color.navy, 25), text_size = size.small)
+
+    // ── Grade row ─────────────────────────────────────────────────────────────
+    gBull = isAplusBull ? "A+" : isABull ? "A" : "–"
+    gBear = isAplusBear ? "A+" : isABear ? "A" : "–"
+    table.cell(dash, 0, 17, "Grade",
+               text_color = color.white, bgcolor = color.new(color.navy, 25), text_size = size.small)
+    table.cell(dash, 1, 17, gBull,
+               text_color = color.lime,  bgcolor = color.new(color.navy, 25), text_size = size.small)
+    table.cell(dash, 2, 17, gBear,
+               text_color = color.lime,  bgcolor = color.new(color.navy, 25), text_size = size.small)
+
+    // ── Signal row ────────────────────────────────────────────────────────────
+    trigTxt = buySignal  ? "⬆  A+ BUY"   :
+              sellSignal ? "⬇  A+ SELL"  : "⬜  WAIT"
+    trigBg  = buySignal  ? color.new(color.lime, 20) :
+              sellSignal ? color.new(color.red,  20) : color.new(color.gray, 60)
+    table.cell(dash, 0, 18, "Signal",
+               text_color = color.white, bgcolor = trigBg, text_size = size.small)
+    table.cell(dash, 1, 18, trigTxt,
+               text_color = color.white, bgcolor = trigBg, text_size = size.small)
+    table.cell(dash, 2, 18, "",
+               text_color = color.white, bgcolor = trigBg, text_size = size.small)
+
+    // ── Execution mode indicator ───────────────────────────────────────────────
+    execStr = executionMode ? "EXEC ON — heavy drawings suppressed" : "Full display"
+    table.cell(dash, 0, 19, execStr,
+               text_color = executionMode ? color.orange : color.gray,
+               bgcolor    = color.new(color.black, 60),
+               text_size  = size.tiny)
+    table.cell(dash, 1, 19, "",
+               bgcolor = color.new(color.black, 60), text_size = size.tiny)
+    table.cell(dash, 2, 19, "",
+               bgcolor = color.new(color.black, 60), text_size = size.tiny)
+
+// =============================================================================
+// SECTION 7 – ALERTS
+// =============================================================================
+
+alertcondition(buySignal,
+               "A+ BUY Signal",
+               "SNAP A+ HUB DEV 007 – A+ BUY signal fired")
+
+alertcondition(sellSignal,
+               "A+ SELL Signal",
+               "SNAP A+ HUB DEV 007 – A+ SELL signal fired")
+
+alertcondition(drtRaidBull,
+               "DRT SSL Raid (Bullish)",
+               "SNAP A+ HUB DEV 007 – DRT sell-side liquidity raided — bullish setup forming")
+
+alertcondition(drtRaidBear,
+               "DRT BSL Raid (Bearish)",
+               "SNAP A+ HUB DEV 007 – DRT buy-side liquidity raided — bearish setup forming")
+
+alertcondition(drtBuyAPlusCore,
+               "DRT A+ BUY Core",
+               "SNAP A+ HUB DEV 007 – DRT confluence threshold reached — A+ BUY ready")
+
+alertcondition(drtSellAPlusCore,
+               "DRT A+ SELL Core",
+               "SNAP A+ HUB DEV 007 – DRT confluence threshold reached — A+ SELL ready")
+
+alertcondition(raidBull,
+               "SSL Raided (Bullish)",
+               "SNAP A+ HUB DEV 007 – Sell-side liquidity (SSL) raided")
+
+alertcondition(raidBear,
+               "BSL Raided (Bearish)",
+               "SNAP A+ HUB DEV 007 – Buy-side liquidity (BSL) raided")
+
+alertcondition(mssBull,
+               "Bullish MSS",
+               "SNAP A+ HUB DEV 007 – Bullish market structure shift detected")
+
+alertcondition(mssBear,
+               "Bearish MSS",
+               "SNAP A+ HUB DEV 007 – Bearish market structure shift detected")
+
+alertcondition(dispBull,
+               "Bullish Displacement",
+               "SNAP A+ HUB DEV 007 – Bullish displacement candle detected")
+
+alertcondition(dispBear,
+               "Bearish Displacement",
+               "SNAP A+ HUB DEV 007 – Bearish displacement candle detected")
+
+alertcondition(fvgBull,
+               "Bullish FVG Created",
+               "SNAP A+ HUB DEV 007 – Bullish fair value gap created")
+
+alertcondition(fvgBear,
+               "Bearish FVG Created",
+               "SNAP A+ HUB DEV 007 – Bearish fair value gap created")
+
+alertcondition(vwapCrossBull,
+               "Bullish VWAP Cross",
+               "SNAP A+ HUB DEV 007 – Price crossed above VWAP")
+
+alertcondition(vwapCrossBear,
+               "Bearish VWAP Cross",
+               "SNAP A+ HUB DEV 007 – Price crossed below VWAP")
+
+alertcondition(isAplusBull or isAplusBear,
+               "A+ Grade (Legacy)",
+               "SNAP A+ HUB DEV 007 – A+ grade reached on legacy score path")
