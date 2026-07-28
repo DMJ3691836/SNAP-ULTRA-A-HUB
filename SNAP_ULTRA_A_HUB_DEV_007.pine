@@ -45,7 +45,7 @@ indicator("SNAP ULTRA A+ HUB DEV 007", shorttitle = "SNAP A+ 007",
 var G_EXEC        = "⚡ Execution Mode"
 executionMode     = input.bool(false, "Execution Mode (Lightweight)",
                    group   = G_EXEC,
-                   tooltip = "When ON: FVG boxes, sweep/exit/pivot lines, inefficiency zones, close-zone packs, and dashboard are all suppressed. Core signal calculations, BUY/SELL A+ labels, and kill-zone backgrounds remain active. Flip ON for live execution to reduce chart overhead.")
+                   tooltip = "When ON: FVG boxes, sweep/exit/pivot lines, inefficiency zones, close-zone packs, and dashboard are all suppressed. Core signal calculations, BUY/SELL A+ labels, and kill zones remain active.")
 
 // Derived gating boolean — all heavy drawing blocks check this
 showHeavyDrawings = not executionMode
@@ -232,14 +232,14 @@ f_trimBoxes(arr, maxLen) =>
 // SECTION 1 – OBSERVATION
 // =============================================================================
 
-// ── Volatility ───────────────────────────────────────────────────────────────
+// ── Volatility ───────────────────────────────────────────────────────────
 atrVal   = ta.atr(14)
 
-// ── EMAs ─────────────────────────────────────────────────────────────────────
+// ── EMAs ─────────────────────────────────────────────────────────────
 emaF     = ta.ema(close, emaFast)
 emaS     = ta.ema(close, emaSlow)
 
-// ── RSI ──────────────────────────────────────────────────────────────────────
+// ── RSI ──────────────────────────────────────────────────────────────
 rsiVal   = ta.rsi(close, rsiLen)
 
 // ── VWAP + deviation bands ────────────────────────────────────────────────────
@@ -259,7 +259,7 @@ bearDelta = close < open ? barBody / barRange : 0.0
 flowBull  = bullDelta >= deltaThreshold
 flowBear  = bearDelta >= deltaThreshold
 
-// ── Swing structure ───────────────────────────────────────────────────────────
+// ── Swing structure ──────────────────────────────────────────────────────────
 swingH   = ta.pivothigh(high, swingLen, swingLen)
 swingL   = ta.pivotlow (low,  swingLen, swingLen)
 
@@ -309,7 +309,7 @@ if not na(swingL)
 // SECTION 2 – INTERPRETATION
 // =============================================================================
 
-// ── EMA trend / flow ──────────────────────────────────────────────────────────
+// ── EMA trend / flow ─────────────────────────────────────────────────────────
 bullTrend   = emaF > emaS and close > emaS
 bearTrend   = emaF < emaS and close < emaS
 emaFlowBull = emaF > emaS and emaF > emaF[1]
@@ -335,11 +335,11 @@ eqHigh     = not na(swingH) and not na(lastSH) and math.abs(swingH - lastSH) / l
 eqLow      = not na(swingL) and not na(lastSL) and math.abs(swingL - lastSL) / lastSL <= eqTol
 buildingLiq = eqHigh or eqLow
 
-// ── Liquidity raids ───────────────────────────────────────────────────────────
+// ── Liquidity raids ──────────────────────────────────────────────────────────
 raidBull = not na(lastSL) and low < lastSL and close > lastSL
 raidBear = not na(lastSH) and high > lastSH and close < lastSH
 
-// ── Displacement ─────────────────────────────────────────────────────────────
+// ── Displacement ───────────────────────────────────────────────────────────
 dispBull = close > open and barBody >= atrVal * displacementAtr and volume > volMa
 dispBear = close < open and barBody >= atrVal * displacementAtr and volume > volMa
 
@@ -391,7 +391,7 @@ if nBearFvg > 0
         if close >= array.get(fvgBearBot, i) and close <= array.get(fvgBearTop, i)
             inBearFvg := true
 
-// ── VWAP alignment ───────────────────────────────────────────────────────────
+// ── VWAP alignment ──────────────────────────────────────────────────────────
 vwapAlignBull = useVwap and close > vwapVal
 vwapAlignBear = useVwap and close < vwapVal
 vwapCrossBull = useVwap and ta.crossover (close, vwapVal)
@@ -590,13 +590,17 @@ isAplusBull  = scoreBull >= apThresh
 isABear      = scoreBear >= aThresh
 isAplusBear  = scoreBear >= apThresh
 
-legacyBuyTrigger  = isAplusBull and dispBull
-                    and (not requireEmaForTrig  or bullTrend)
-                    and (not requireFlowForTrig or flowBull)
+legacyBuyTrigger = (
+    isAplusBull and dispBull and
+    (not requireEmaForTrig or bullTrend) and
+    (not requireFlowForTrig or flowBull)
+)
 
-legacySellTrigger = isAplusBear and dispBear
-                    and (not requireEmaForTrig  or bearTrend)
-                    and (not requireFlowForTrig or flowBear)
+legacySellTrigger = (
+    isAplusBear and dispBear and
+    (not requireEmaForTrig or bearTrend) and
+    (not requireFlowForTrig or flowBear)
+)
 
 // =============================================================================
 // SECTION 5 – SIGNAL GENERATION (cooldown applied)
@@ -997,247 +1001,3 @@ var table dash = table.new(dashPos, 3, 20,
                            bgcolor      = color.new(color.black, 55),
                            border_width = 1,
                            border_color = color.new(color.white, 70))
-
-showDash = showDashboard and not executionMode
-
-if showDash and barstate.islast
-
-    // ── Header row ────────────────────────────────────────────────────────────
-    table.cell(dash, 0, 0, "SNAP ULTRA A+ HUB DEV 007",
-               text_color = color.white,
-               bgcolor    = color.new(color.navy, 10),
-               text_size  = size.small)
-    table.cell(dash, 1, 0, "BULL",
-               text_color = color.teal,
-               bgcolor    = color.new(color.navy, 10),
-               text_size  = size.small)
-    table.cell(dash, 2, 0, "BEAR",
-               text_color = color.red,
-               bgcolor    = color.new(color.navy, 10),
-               text_size  = size.small)
-
-    // ── Mode row ──────────────────────────────────────────────────────────────
-    modeStr = useDRTModel ? "DRT MODEL" : "LEGACY SCORE"
-    table.cell(dash, 0, 1, "Mode: " + modeStr,
-               text_color = color.yellow,
-               bgcolor    = color.new(color.navy, 25),
-               text_size  = size.tiny)
-    table.cell(dash, 1, 1, "",
-               bgcolor = color.new(color.navy, 25), text_size = size.tiny)
-    table.cell(dash, 2, 1, "",
-               bgcolor = color.new(color.navy, 25), text_size = size.tiny)
-
-    // ── Market state rows ─────────────────────────────────────────────────────
-    table.cell(dash, 0,  2, "EMA Trend",
-               text_color = color.white, bgcolor = f_bg(bullTrend or bearTrend), text_size = size.small)
-    table.cell(dash, 1,  2, f_tick(bullTrend),
-               text_color = color.white, bgcolor = f_bg(bullTrend),  text_size = size.small)
-    table.cell(dash, 2,  2, f_tick(bearTrend),
-               text_color = color.white, bgcolor = f_bg(bearTrend),  text_size = size.small)
-
-    table.cell(dash, 0,  3, "EMA Flow",
-               text_color = color.white, bgcolor = f_bg(emaFlowBull or emaFlowBear), text_size = size.small)
-    table.cell(dash, 1,  3, f_tick(emaFlowBull),
-               text_color = color.white, bgcolor = f_bg(emaFlowBull), text_size = size.small)
-    table.cell(dash, 2,  3, f_tick(emaFlowBear),
-               text_color = color.white, bgcolor = f_bg(emaFlowBear), text_size = size.small)
-
-    table.cell(dash, 0,  4, "Liquidity Raid",
-               text_color = color.white, bgcolor = f_bg(raidBull or raidBear), text_size = size.small)
-    table.cell(dash, 1,  4, f_tick(raidBull),
-               text_color = color.white, bgcolor = f_bg(raidBull), text_size = size.small)
-    table.cell(dash, 2,  4, f_tick(raidBear),
-               text_color = color.white, bgcolor = f_bg(raidBear), text_size = size.small)
-
-    table.cell(dash, 0,  5, "DRT Raid",
-               text_color = color.white, bgcolor = f_bg(drtRaidBull or drtRaidBear), text_size = size.small)
-    table.cell(dash, 1,  5, f_tick(drtRaidBullActive),
-               text_color = color.white, bgcolor = f_bg(drtRaidBullActive), text_size = size.small)
-    table.cell(dash, 2,  5, f_tick(drtRaidBearActive),
-               text_color = color.white, bgcolor = f_bg(drtRaidBearActive), text_size = size.small)
-
-    table.cell(dash, 0,  6, "DRT Displacement",
-               text_color = color.white, bgcolor = f_bg(drtPostRaidDispBull or drtPostRaidDispBear), text_size = size.small)
-    table.cell(dash, 1,  6, f_tick(drtPostRaidDispBull),
-               text_color = color.white, bgcolor = f_bg(drtPostRaidDispBull), text_size = size.small)
-    table.cell(dash, 2,  6, f_tick(drtPostRaidDispBear),
-               text_color = color.white, bgcolor = f_bg(drtPostRaidDispBear), text_size = size.small)
-
-    table.cell(dash, 0,  7, "MSS",
-               text_color = color.white, bgcolor = f_bg(mssBull or mssBear), text_size = size.small)
-    table.cell(dash, 1,  7, f_tick(mssBull),
-               text_color = color.white, bgcolor = f_bg(mssBull), text_size = size.small)
-    table.cell(dash, 2,  7, f_tick(mssBear),
-               text_color = color.white, bgcolor = f_bg(mssBear), text_size = size.small)
-
-    table.cell(dash, 0,  8, "Displacement",
-               text_color = color.white, bgcolor = f_bg(dispBull or dispBear), text_size = size.small)
-    table.cell(dash, 1,  8, f_tick(dispBull),
-               text_color = color.white, bgcolor = f_bg(dispBull), text_size = size.small)
-    table.cell(dash, 2,  8, f_tick(dispBear),
-               text_color = color.white, bgcolor = f_bg(dispBear), text_size = size.small)
-
-    table.cell(dash, 0,  9, "Prem / Disc",
-               text_color = color.white, bgcolor = f_bg(inPremium or inDiscount), text_size = size.small)
-    table.cell(dash, 1,  9, f_tick(inDiscount) + " DISC",
-               text_color = color.white, bgcolor = f_bg(inDiscount), text_size = size.small)
-    table.cell(dash, 2,  9, f_tick(inPremium) + " PREM",
-               text_color = color.white, bgcolor = f_bg(inPremium),  text_size = size.small)
-
-    table.cell(dash, 0, 10, "FVG Retrace",
-               text_color = color.white, bgcolor = f_bg(inBullFvg or inBearFvg), text_size = size.small)
-    table.cell(dash, 1, 10, f_tick(inBullFvg),
-               text_color = color.white, bgcolor = f_bg(inBullFvg), text_size = size.small)
-    table.cell(dash, 2, 10, f_tick(inBearFvg),
-               text_color = color.white, bgcolor = f_bg(inBearFvg), text_size = size.small)
-
-    table.cell(dash, 0, 11, "DRT FVG",
-               text_color = color.white, bgcolor = f_bg(inDrtFvgBull or inDrtFvgBear), text_size = size.small)
-    table.cell(dash, 1, 11, f_tick(inDrtFvgBull),
-               text_color = color.white, bgcolor = f_bg(inDrtFvgBull), text_size = size.small)
-    table.cell(dash, 2, 11, f_tick(inDrtFvgBear),
-               text_color = color.white, bgcolor = f_bg(inDrtFvgBear), text_size = size.small)
-
-    table.cell(dash, 0, 12, "DRT Retest",
-               text_color = color.white, bgcolor = f_bg(drtRetestBull or drtRetestBear), text_size = size.small)
-    table.cell(dash, 1, 12, f_tick(drtRetestBull),
-               text_color = color.white, bgcolor = f_bg(drtRetestBull), text_size = size.small)
-    table.cell(dash, 2, 12, f_tick(drtRetestBear),
-               text_color = color.white, bgcolor = f_bg(drtRetestBear), text_size = size.small)
-
-    table.cell(dash, 0, 13, "VWAP Align",
-               text_color = color.white, bgcolor = f_bg(vwapAlignBull or vwapAlignBear), text_size = size.small)
-    table.cell(dash, 1, 13, f_tick(vwapAlignBull),
-               text_color = color.white, bgcolor = f_bg(vwapAlignBull), text_size = size.small)
-    table.cell(dash, 2, 13, f_tick(vwapAlignBear),
-               text_color = color.white, bgcolor = f_bg(vwapAlignBear), text_size = size.small)
-
-    table.cell(dash, 0, 14, "Delta Flow",
-               text_color = color.white, bgcolor = f_bg(flowBull or flowBear), text_size = size.small)
-    table.cell(dash, 1, 14, f_tick(flowBull),
-               text_color = color.white, bgcolor = f_bg(flowBull), text_size = size.small)
-    table.cell(dash, 2, 14, f_tick(flowBear),
-               text_color = color.white, bgcolor = f_bg(flowBear), text_size = size.small)
-
-    table.cell(dash, 0, 15, "High Volume",
-               text_color = color.white, bgcolor = f_bg(highVol), text_size = size.small)
-    table.cell(dash, 1, 15, f_tick(highVol),
-               text_color = color.white, bgcolor = f_bg(highVol), text_size = size.small)
-    table.cell(dash, 2, 15, f_tick(highVol),
-               text_color = color.white, bgcolor = f_bg(highVol), text_size = size.small)
-
-    // ── Score row ─────────────────────────────────────────────────────────────
-    scoreLabel = useDRTModel ? "DRT Score (/ 15)" : "Score (/ 12)"
-    dispBull2  = useDRTModel ? drtScoreBull : scoreBull
-    dispBear2  = useDRTModel ? drtScoreBear : scoreBear
-    table.cell(dash, 0, 16, scoreLabel,
-               text_color = color.white,  bgcolor = color.new(color.navy, 25), text_size = size.small)
-    table.cell(dash, 1, 16, str.tostring(dispBull2),
-               text_color = color.yellow, bgcolor = color.new(color.navy, 25), text_size = size.small)
-    table.cell(dash, 2, 16, str.tostring(dispBear2),
-               text_color = color.yellow, bgcolor = color.new(color.navy, 25), text_size = size.small)
-
-    // ── Grade row ─────────────────────────────────────────────────────────────
-    gBull = isAplusBull ? "A+" : isABull ? "A" : "–"
-    gBear = isAplusBear ? "A+" : isABear ? "A" : "–"
-    table.cell(dash, 0, 17, "Grade",
-               text_color = color.white, bgcolor = color.new(color.navy, 25), text_size = size.small)
-    table.cell(dash, 1, 17, gBull,
-               text_color = color.lime,  bgcolor = color.new(color.navy, 25), text_size = size.small)
-    table.cell(dash, 2, 17, gBear,
-               text_color = color.lime,  bgcolor = color.new(color.navy, 25), text_size = size.small)
-
-    // ── Signal row ────────────────────────────────────────────────────────────
-    trigTxt = buySignal  ? "⬆  A+ BUY"   :
-              sellSignal ? "⬇  A+ SELL"  : "⬜  WAIT"
-    trigBg  = buySignal  ? color.new(color.lime, 20) :
-              sellSignal ? color.new(color.red,  20) : color.new(color.gray, 60)
-    table.cell(dash, 0, 18, "Signal",
-               text_color = color.white, bgcolor = trigBg, text_size = size.small)
-    table.cell(dash, 1, 18, trigTxt,
-               text_color = color.white, bgcolor = trigBg, text_size = size.small)
-    table.cell(dash, 2, 18, "",
-               text_color = color.white, bgcolor = trigBg, text_size = size.small)
-
-    // ── Execution mode indicator ───────────────────────────────────────────────
-    execStr = executionMode ? "EXEC ON — heavy drawings suppressed" : "Full display"
-    table.cell(dash, 0, 19, execStr,
-               text_color = executionMode ? color.orange : color.gray,
-               bgcolor    = color.new(color.black, 60),
-               text_size  = size.tiny)
-    table.cell(dash, 1, 19, "",
-               bgcolor = color.new(color.black, 60), text_size = size.tiny)
-    table.cell(dash, 2, 19, "",
-               bgcolor = color.new(color.black, 60), text_size = size.tiny)
-
-// =============================================================================
-// SECTION 7 – ALERTS
-// =============================================================================
-
-alertcondition(buySignal,
-               "A+ BUY Signal",
-               "SNAP A+ HUB DEV 007 – A+ BUY signal fired")
-
-alertcondition(sellSignal,
-               "A+ SELL Signal",
-               "SNAP A+ HUB DEV 007 – A+ SELL signal fired")
-
-alertcondition(drtRaidBull,
-               "DRT SSL Raid (Bullish)",
-               "SNAP A+ HUB DEV 007 – DRT sell-side liquidity raided — bullish setup forming")
-
-alertcondition(drtRaidBear,
-               "DRT BSL Raid (Bearish)",
-               "SNAP A+ HUB DEV 007 – DRT buy-side liquidity raided — bearish setup forming")
-
-alertcondition(drtBuyAPlusCore,
-               "DRT A+ BUY Core",
-               "SNAP A+ HUB DEV 007 – DRT confluence threshold reached — A+ BUY ready")
-
-alertcondition(drtSellAPlusCore,
-               "DRT A+ SELL Core",
-               "SNAP A+ HUB DEV 007 – DRT confluence threshold reached — A+ SELL ready")
-
-alertcondition(raidBull,
-               "SSL Raided (Bullish)",
-               "SNAP A+ HUB DEV 007 – Sell-side liquidity (SSL) raided")
-
-alertcondition(raidBear,
-               "BSL Raided (Bearish)",
-               "SNAP A+ HUB DEV 007 – Buy-side liquidity (BSL) raided")
-
-alertcondition(mssBull,
-               "Bullish MSS",
-               "SNAP A+ HUB DEV 007 – Bullish market structure shift detected")
-
-alertcondition(mssBear,
-               "Bearish MSS",
-               "SNAP A+ HUB DEV 007 – Bearish market structure shift detected")
-
-alertcondition(dispBull,
-               "Bullish Displacement",
-               "SNAP A+ HUB DEV 007 – Bullish displacement candle detected")
-
-alertcondition(dispBear,
-               "Bearish Displacement",
-               "SNAP A+ HUB DEV 007 – Bearish displacement candle detected")
-
-alertcondition(fvgBull,
-               "Bullish FVG Created",
-               "SNAP A+ HUB DEV 007 – Bullish fair value gap created")
-
-alertcondition(fvgBear,
-               "Bearish FVG Created",
-               "SNAP A+ HUB DEV 007 – Bearish fair value gap created")
-
-alertcondition(vwapCrossBull,
-               "Bullish VWAP Cross",
-               "SNAP A+ HUB DEV 007 – Price crossed above VWAP")
-
-alertcondition(vwapCrossBear,
-               "Bearish VWAP Cross",
-               "SNAP A+ HUB DEV 007 – Price crossed below VWAP")
-
-alertcondition(isAplusBull or isAplusBear,
-               "A+ Grade (Legacy)",
-               "SNAP A+ HUB DEV 007 – A+ grade reached on legacy score path")
