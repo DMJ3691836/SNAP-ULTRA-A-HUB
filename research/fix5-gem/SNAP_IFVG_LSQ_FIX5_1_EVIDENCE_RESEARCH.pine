@@ -1,0 +1,2511 @@
+//@version=6
+
+indicator("Liquidity IFVG LSQ V6.4 FIX5.1 Evidence - Research", shorttitle="FIX5.1 EVIDENCE", overlay=true, max_bars_back=2500, max_lines_count=500, max_boxes_count=300, max_labels_count=500)
+
+//=============================================================================
+
+// V6.4 - MULTI-PATH SEQUENCE ENGINE
+//
+// PATH A - PRIMARY LIQUIDITY REVERSAL
+// Sweep -> LSQ -> Displacement/BOS -> IFVG -> Setup-line break -> Entry
+//
+// PATH B - FAILED-PATH REVERSAL
+// Qualified Path A trade -> directional path failure -> opposite displacement/BOS
+// -> geometry-qualified reversal entry
+//
+// PATH C - TP1 CONTINUATION
+// TP1 hit -> body acceptance beyond TP1 -> runner promoted toward external 1H TP2.
+// This is a continuation state of the original ticket, not a duplicate fresh position.
+//
+// PATH D - COMPRESSION BREAK
+// Qualified Sweep -> LSQ -> Displacement/BOS -> IFVG -> post-IFVG compression
+// -> directional expansion/break -> geometry-qualified entry
+//
+// TRADE GEOMETRY GATE
+// LONG: Stop < Entry < TP1 and TP2 (if present) > TP1
+// SHORT: TP1 < Entry < Stop and TP2 (if present) < TP1
+
+//
+
+// BEARISH:
+
+// Buy-Side Sweep -> LSQ -> Bearish Displacement/BOS -> IFVG
+
+// -> Rising/Equal-Low Liquidity Trendline -> Break -> Sell-Side Exit Key Level
+
+//
+
+// BULLISH:
+
+// Sell-Side Sweep -> LSQ -> Bullish Displacement/BOS -> IFVG
+
+// -> Falling/Equal-High Liquidity Trendline -> Break -> Buy-Side Exit Key Level
+
+//
+
+// LSQ = Liquidity Sweep Quality. It grades the originating sweep only.
+
+// It is NOT a completed-trade score.
+
+//
+
+// Stage:
+
+// 0 IDLE | 1 SWEEP | 2 DISPLACEMENT | 3 IFVG | 4 TRENDLINE | 5 CONFIRMED
+
+//=============================================================================
+
+// INPUT GROUPS - canonical V6.3 configuration
+string G_TIME    = "1. 15M Engine"
+string G_SWEEP   = "2. Liquidity Sweep"
+string G_LSQ     = "3. Liquidity Sweep Quality (LSQ)"
+string G_DISP    = "4. Displacement / BOS"
+string G_IFVG    = "5. IFVG / Structure"
+string G_TREND   = "6. Trendline Liquidity / Entry"
+string G_TARGET  = "7. Target Extension Engine"
+string G_STATE   = "8. Stateful Directional Path Engine"
+string G_DISPLAY = "9. Display / Trade Ticket"
+string G_ALERT   = "10. Alerts / Webhook"
+string G_MULTI   = "11. V6.4 Multi-Path Engine"
+string G_GEM     = "12. GEM Parent / Child Authority (Research)"
+
+anchorTF = input.timeframe("15", "Anchor timeframe", group=G_TIME)
+
+pivotLength        = input.int(3, "Swing pivot strength", minval=1, maxval=15, group=G_SWEEP)
+
+sweepToleranceTicks= input.int(0, "Sweep tolerance in ticks", minval=0, maxval=100, group=G_SWEEP)
+
+sweepToDispBars    = input.int(12, "Maximum bars: Sweep -> Displacement", minval=1, maxval=40, group=G_SWEEP)
+
+detectBearish      = input.bool(true, "Detect bearish models", group=G_SWEEP)
+
+detectBullish      = input.bool(true, "Detect bullish models", group=G_SWEEP)
+
+volumeLength       = input.int(20, "Volume average length", minval=5, maxval=100, group=G_LSQ)
+
+volumeMultiplier   = input.float(1.20, "High-volume threshold", minval=0.50, maxval=5.00, step=0.05, group=G_LSQ)
+
+wickBodyRatio      = input.float(0.70, "Absorption wick/body ratio", minval=0.10, maxval=5.00, step=0.05, group=G_LSQ)
+
+rsiLength          = input.int(14, "RSI length", minval=2, maxval=100, group=G_LSQ)
+
+rsiBearExtreme     = input.float(65.0, "Bearish RSI extreme", minval=50.0, maxval=100.0, group=G_LSQ)
+
+rsiBullExtreme     = input.float(35.0, "Bullish RSI extreme", minval=0.0, maxval=50.0, group=G_LSQ)
+
+minimumLSQ         = input.int(45, "Minimum valid LSQ", minval=35, maxval=100, group=G_LSQ)
+
+requireDivergence  = input.bool(false, "Require RSI divergence", group=G_LSQ)
+
+atrLength          = input.int(14, "ATR length", minval=2, group=G_DISP)
+
+minimumDispATR     = input.float(0.60, "Minimum displacement body / ATR", minval=0.10, maxval=3.00, step=0.05, group=G_DISP)
+
+bosLookback        = input.int(3, "Local BOS lookback", minval=2, maxval=10, group=G_DISP)
+
+ifvgExtendBars     = input.int(24, "IFVG projection bars", minval=2, maxval=200, group=G_IFVG)
+
+maxIFVGATR         = input.float(1.25, "Maximum IFVG thickness / ATR", minval=0.05, maxval=5.00, step=0.05, group=G_IFVG)
+
+requireIFVGForFinal= input.bool(true, "Require IFVG before final confirmation", group=G_IFVG)
+
+trendPivotLength   = input.int(2, "Trendline pivot strength", minval=1, maxval=10, group=G_TREND)
+
+minimumTrendTouches= input.int(3, "Touches required for final break", minval=2, maxval=6, group=G_TREND)
+
+trendTouchATR      = input.float(0.18, "Touch tolerance / ATR", minval=0.01, maxval=1.00, step=0.01, group=G_TREND)
+
+trendBreakATR      = input.float(0.05, "Break tolerance / ATR", minval=0.00, maxval=1.00, step=0.01, group=G_TREND)
+
+trendSearchBars    = input.int(60, "Maximum bars to build trendline", minval=10, maxval=200, group=G_TREND)
+
+maxTrendPoints     = input.int(12, "Maximum trend pivots scored", minval=3, maxval=20, group=G_TREND)
+
+requireCloseBreak  = input.bool(true, "Require close through trendline", group=G_TREND)
+
+trendProjectionBars= input.int(8, "Active trendline projection bars", minval=1, maxval=40, group=G_TREND)
+
+showTwoTouchCandidates=input.bool(false, "Show 2-touch candidate trendlines", group=G_TREND)
+
+keepCompletedTrendlines=input.bool(true, "Keep completed trendlines", group=G_TREND)
+
+completedTrendlineMode=input.string("Fixed Bars", "Completed trendline extension mode", options=["Fixed Bars","Extend Right"], group=G_TREND)
+
+completedTrendlineBars=input.int(96, "Completed trendline extension bars", minval=0, maxval=500, group=G_TREND)
+
+pathPivotLength     = input.int(2, "Post-entry path pivot strength", minval=1, maxval=10, group=G_TREND)
+
+pathMinimumTouches  = input.int(2, "Post-entry path minimum touches", minval=2, maxval=6, group=G_TREND)
+
+pathTouchATR        = input.float(0.18, "Post-entry path touch tolerance / ATR", minval=0.01, maxval=1.00, step=0.01, group=G_TREND)
+
+pathProjectionBars  = input.int(8, "Post-entry path projection bars", minval=1, maxval=40, group=G_TREND)
+
+pathMaxPoints       = input.int(12, "Maximum post-entry path pivots", minval=3, maxval=20, group=G_TREND)
+
+showTradePath       = input.bool(true, "Show active directional trade path", group=G_TREND)
+
+requireFullBodyExit = input.bool(true, "Path exit requires full candle body beyond path", group=G_TREND)
+
+showPathExitLabels  = input.bool(true, "Show directional path exit labels", group=G_TREND)
+
+targetLookback      = input.int(60, "Conservative TP1 liquidity lookback", minval=10, maxval=300, group=G_TARGET)
+targetLineBars      = input.int(30, "Target line length", minval=5, maxval=200, group=G_TARGET)
+extensionTF         = input.timeframe("60", "External liquidity timeframe (TP2)", group=G_TARGET)
+extensionPivotLength= input.int(3, "External 1H swing strength", minval=1, maxval=12, group=G_TARGET)
+enableTargetExtension=input.bool(true, "Enable TP2 external-liquidity extension", group=G_TARGET)
+requireTP1Acceptance=input.bool(true, "Require full body acceptance beyond TP1", group=G_TARGET, tooltip="After TP1 is touched, a later anchor candle must have its full real body beyond TP1 before the runner is promoted to TP2.")
+showTP2Targets      = input.bool(true, "Show TP2 external liquidity", group=G_TARGET)
+keepRunnerAfterTP2  = input.bool(false, "Keep runner active after TP2", group=G_TARGET, tooltip="If enabled, TP2 is informational and the directional path remains the final exit.")
+
+lockAfterDisplacement=input.bool(true, "Lock model after displacement", group=G_STATE, tooltip="A new same-direction sweep cannot overwrite a model once displacement has confirmed.")
+
+replaceSweepWithHigherLSQ=input.bool(true, "Before displacement, replace only with equal/higher LSQ", group=G_STATE)
+
+modelTimeoutBars    = input.int(80, "Maximum bars after displacement", minval=10, maxval=300, group=G_STATE)
+
+resetOnOppositeFinal=input.bool(false, "Opposite final signal cancels developing model", group=G_STATE)
+
+showSweep           = input.bool(true, "Show yellow sweep levels", group=G_DISPLAY)
+
+showIFVG            = input.bool(true, "Show orange IFVG zones", group=G_DISPLAY)
+
+showTrendline       = input.bool(true, "Show green trendline liquidity", group=G_DISPLAY)
+
+showTargets         = input.bool(true, "Show blue Exit Key Levels", group=G_DISPLAY)
+
+showLSQ             = input.bool(true, "Show LSQ score", group=G_DISPLAY)
+
+fullSweepLabelLSQ   = input.int(60, "Full sweep label minimum LSQ", minval=35, maxval=100, group=G_DISPLAY)
+
+showLowScoreSweepMarkers=input.bool(true, "Show compact low-score sweep markers", group=G_DISPLAY)
+
+showFinalLabels     = input.bool(true, "Show completed LONG / SHORT model labels", group=G_DISPLAY)
+showTradeTicket      = input.bool(true, "Show latest trade ticket (bottom left)", group=G_DISPLAY)
+showTradeLevels      = input.bool(true, "Show entry / stop / target levels", group=G_DISPLAY)
+showTargetHitLabels  = input.bool(true, "Show opposing-liquidity target hit labels", group=G_DISPLAY)
+
+debugMode           = input.bool(false, "Debug model stages", group=G_DISPLAY)
+
+enableSweepAlerts   = input.bool(true, "Liquidity sweep alerts", group=G_ALERT)
+
+enableFinalAlerts   = input.bool(true, "Final setup alerts", group=G_ALERT)
+
+enableWebhook       = input.bool(false, "Enable JSON webhook via alert()", group=G_ALERT)
+
+webhookSecret       = input.string("", "Webhook secret (optional)", group=G_ALERT)
+
+enablePathA          = input.bool(true, "Path A - Primary Liquidity Reversal", group=G_MULTI)
+enablePathB          = input.bool(true, "Path B - Failed-Path Reversal", group=G_MULTI)
+enablePathC          = input.bool(true, "Path C - TP1 Continuation", group=G_MULTI)
+enablePathD          = input.bool(true, "Path D - Compression Break", group=G_MULTI)
+enforceTradeGeometry = input.bool(true, "Enforce valid stop/entry/target geometry", group=G_MULTI)
+failedPathWindow     = input.int(6, "Path B confirmation window (anchor bars)", minval=1, maxval=20, group=G_MULTI)
+compressionBars      = input.int(4, "Path D compression lookback", minval=2, maxval=12, group=G_MULTI)
+compressionATR       = input.float(1.40, "Path D max compression range / ATR", minval=0.30, maxval=4.00, step=0.05, group=G_MULTI)
+compressionBreakATR  = input.float(0.05, "Path D break buffer / ATR", minval=0.00, maxval=0.50, step=0.01, group=G_MULTI)
+showPathModelLabels  = input.bool(true, "Show A/B/C/D model labels", group=G_MULTI)
+blockConcurrentTrades = input.bool(true, "FIX2 - Block new entry while ticket active", group=G_MULTI)
+showSequenceOnLabels  = input.bool(true, "FIX2 - Show sequence ID on entry labels", group=G_MULTI)
+// Default OBSERVE. Child confirmation cannot be inferred from a 15m displacement candle.
+gemParentTF         = input.timeframe("60", "Higher-timeframe Parent authority", group=G_GEM)
+gemParentPivot      = input.int(3, "Parent structural pivot strength", minval=1, maxval=12, group=G_GEM)
+gemChildPivot       = input.int(2, "5m / 1m Child structural pivot strength", minval=1, maxval=8, group=G_GEM)
+gemRequireChildProof= input.bool(false, "RESEARCH ONLY: require 5m + 1m structural proof before FIX5 entry", group=G_GEM, tooltip="OFF preserves frozen FIX5 entries. ON filters new entries using lower-TF structure; requires chart TF = Anchor TF. DOES NOT certify GEM, EER or grant live execution.")
+gemShowTicketRows   = input.bool(true, "Show Parent / Child candidate snapshot on ticket", group=G_GEM)
+
+color sweepColor = color.yellow
+
+color ifvgColor  = color.orange
+
+color trendColor = color.green
+
+color exitColor  = color.blue
+
+//=============================================================================
+
+// ANCHOR-TIMEFRAME CONTEXT
+
+//=============================================================================
+
+f_context() =>
+
+    float r = ta.rsi(close, rsiLength)
+
+    float a = ta.atr(atrLength)
+
+    float v = ta.sma(volume, volumeLength)
+
+    float ph = ta.pivothigh(high, pivotLength, pivotLength)
+
+    float pl = ta.pivotlow(low, pivotLength, pivotLength)
+
+    float tph = ta.pivothigh(high, trendPivotLength, trendPivotLength)
+
+    float tpl = ta.pivotlow(low, trendPivotLength, trendPivotLength)
+
+    float pathPH = ta.pivothigh(high, pathPivotLength, pathPivotLength)
+
+    float pathPL = ta.pivotlow(low, pathPivotLength, pathPivotLength)
+
+    float latestPH = ta.valuewhen(not na(ph), ph, 0)
+
+    float priorPH  = ta.valuewhen(not na(ph), ph, 1)
+
+    float latestPL = ta.valuewhen(not na(pl), pl, 0)
+
+    float priorPL  = ta.valuewhen(not na(pl), pl, 1)
+
+    float latestPHRsi = ta.valuewhen(not na(ph), r[pivotLength], 0)
+
+    float priorPHRsi  = ta.valuewhen(not na(ph), r[pivotLength], 1)
+
+    float latestPLRsi = ta.valuewhen(not na(pl), r[pivotLength], 0)
+
+    float priorPLRsi  = ta.valuewhen(not na(pl), r[pivotLength], 1)
+
+    float localHigh = ta.highest(high[1], bosLookback)
+
+    float localLow  = ta.lowest(low[1], bosLookback)
+
+    float fallbackHigh = ta.highest(high[1], targetLookback)
+
+    float fallbackLow  = ta.lowest(low[1], targetLookback)
+
+    [time, time_close, open, high, low, close, volume, r, a, v,
+
+     latestPH, priorPH, latestPL, priorPL, latestPHRsi, priorPHRsi, latestPLRsi, priorPLRsi,
+
+     tph, tpl, pathPH, pathPL, localHigh, localLow, fallbackHigh, fallbackLow,
+
+     open[1], high[1], low[1], close[1], time[1], open[2], high[2], low[2], close[2], time[2]]
+
+[t15,tc15,o15,h15,l15,c15,v15,rsi15,atr15,volAvg15,
+
+ swingHigh,oldSwingHigh,swingLow,oldSwingLow,swingHighRsi,oldSwingHighRsi,swingLowRsi,oldSwingLowRsi,
+
+ trendPH15,trendPL15,pathPH15,pathPL15,localHigh15,localLow15,fallbackTargetHigh,fallbackTargetLow,
+
+ oPrev,hPrev,lPrev,cPrev,tPrev,oTwo,hTwo,lTwo,cTwo,tTwo] =
+
+ request.security(syminfo.tickerid, anchorTF, f_context(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+//=========================================================================
+// FIX5 GEM RESEARCH: structure-based authority evidence, NOT A+ certification.
+// Parent and child are independent structural state machines. No EER/DEX or
+// full 7-step Story evidence is manufactured by this indicator.
+//=========================================================================
+f_gem_structure(int strength) =>
+    float ph = ta.pivothigh(high, strength, strength)
+    float pl = ta.pivotlow(low, strength, strength)
+    float refHigh = ta.valuewhen(not na(ph), ph, 0)
+    float refLow  = ta.valuewhen(not na(pl), pl, 0)
+    var int structuralDir = 0
+    if not na(refHigh) and close > refHigh
+        structuralDir := 1
+    else if not na(refLow) and close < refLow
+        structuralDir := -1
+    structuralDir
+
+// [1] + lookahead_on is deliberate for HTF: previous CONFIRMED 1H bar.
+int gemParentDir = request.security(syminfo.tickerid, gemParentTF,
+     f_gem_structure(gemParentPivot)[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+// For a 15m chart, lookahead_off selects the latest lower-TF intrabar;
+// [1] excludes its developing candle. Only 15m confirmed snapshots are used.
+int gemChild5 = request.security(syminfo.tickerid, "5",
+     f_gem_structure(gemChildPivot)[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+int gemChild1 = request.security(syminfo.tickerid, "1",
+     f_gem_structure(gemChildPivot)[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+// Confirmed external liquidity pools. valuewhen() keeps the last confirmed 1H swing persistent.
+f_external_liquidity() =>
+    float ph = ta.pivothigh(high, extensionPivotLength, extensionPivotLength)
+    float pl = ta.pivotlow(low, extensionPivotLength, extensionPivotLength)
+    float h0 = ta.valuewhen(not na(ph), ph, 0)
+    float h1 = ta.valuewhen(not na(ph), ph, 1)
+    float h2 = ta.valuewhen(not na(ph), ph, 2)
+    float l0 = ta.valuewhen(not na(pl), pl, 0)
+    float l1 = ta.valuewhen(not na(pl), pl, 1)
+    float l2 = ta.valuewhen(not na(pl), pl, 2)
+    [h0,h1,h2,l0,l1,l2]
+
+[extHigh0,extHigh1,extHigh2,extLow0,extLow1,extLow2] =
+ request.security(syminfo.tickerid, extensionTF, f_external_liquidity(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+bool new15 = ta.change(t15) != 0
+// 15m bridge structural authority uses existing FIX5 confirmed pivot levels.
+// Its raw direction is independent of Parent; relationship is side-dependent.
+var int gemBridgeDir = 0
+if new15
+    if not na(swingHigh) and c15 > swingHigh
+        gemBridgeDir := 1
+    else if not na(swingLow) and c15 < swingLow
+        gemBridgeDir := -1
+bool gemChartAligned = timeframe.in_seconds(timeframe.period) == timeframe.in_seconds(anchorTF)
+
+f_gem_dir_name(int d) =>
+    d == 1 ? "BULLISH" : d == -1 ? "BEARISH" : "UNRESOLVED"
+
+f_gem_child_ok(int side) =>
+    gemChild5 == side and gemChild1 == side
+
+f_gem_bridge_name(int side) =>
+    gemParentDir == side and gemBridgeDir == side ? "ALIGNED" : gemParentDir == side and gemBridgeDir == -side ? "CONTRADICTORY" : "TRANSITIONAL"
+
+// Codes 0 = FORMING/UNRESOLVED; 1 = parent aligned candidate;
+// 2 = independently developed tactical Child candidate. NO A+ assertion.
+f_gem_class_code(int side) =>
+    not f_gem_child_ok(side) ? 0 : gemParentDir == side and gemBridgeDir == side ? 1 : 2
+
+f_gem_class_name(int c) =>
+    c == 1 ? "PARENT-ALIGNED CANDIDATE" : c == 2 ? "TACTICAL CHILD CANDIDATE" : "CHILD PROOF PENDING"
+
+f_gem_privilege_name(int c) =>
+    c == 1 ? "FULL - PENDING NEXUS" : c == 2 ? "REDUCED - PENDING NEXUS" : "NONE - PENDING PROOF"
+
+f_gem_entry_allowed(int side) =>
+    not gemRequireChildProof or (gemChartAligned and f_gem_child_ok(side))
+
+int barMs = int(timeframe.in_seconds(anchorTF) * 1000)
+
+float sweepTolerance = sweepToleranceTicks * syminfo.mintick
+
+float trendTouchTolerance = atr15 * trendTouchATR
+
+float trendBreakTolerance = atr15 * trendBreakATR
+
+//=============================================================================
+
+// SWEEP + LSQ
+
+//=============================================================================
+
+float body15 = math.max(math.abs(c15-o15), syminfo.mintick)
+
+float upperWick15 = h15 - math.max(o15,c15)
+
+float lowerWick15 = math.min(o15,c15) - l15
+
+float range15 = math.max(h15-l15, syminfo.mintick)
+
+bool rawBuySideSweep  = not na(swingHigh) and h15 > swingHigh + sweepTolerance and c15 < swingHigh
+
+bool rawSellSideSweep = not na(swingLow)  and l15 < swingLow  - sweepTolerance and c15 > swingLow
+
+bool highVolume = not na(volAvg15) and volAvg15 > 0 and v15 >= volAvg15 * volumeMultiplier
+
+bool upperAbsorption = upperWick15 / body15 >= wickBodyRatio
+
+bool lowerAbsorption = lowerWick15 / body15 >= wickBodyRatio
+
+bool closeLowerHalf = c15 <= l15 + range15 * 0.50
+
+bool closeUpperHalf = c15 >= l15 + range15 * 0.50
+
+bool bearishDivergence = not na(swingHigh) and not na(oldSwingHigh) and not na(swingHighRsi) and not na(oldSwingHighRsi) and swingHigh > oldSwingHigh and swingHighRsi < oldSwingHighRsi
+
+bool bullishDivergence = not na(swingLow) and not na(oldSwingLow) and not na(swingLowRsi) and not na(oldSwingLowRsi) and swingLow < oldSwingLow and swingLowRsi > oldSwingLowRsi
+
+int bearishLSQ = rawBuySideSweep ? 35 : 0
+
+bearishLSQ += highVolume ? 15 : 0
+
+bearishLSQ += upperAbsorption ? 15 : 0
+
+bearishLSQ += rsi15 >= rsiBearExtreme ? 10 : 0
+
+bearishLSQ += bearishDivergence ? 15 : 0
+
+bearishLSQ += closeLowerHalf ? 10 : 0
+
+int bullishLSQ = rawSellSideSweep ? 35 : 0
+
+bullishLSQ += highVolume ? 15 : 0
+
+bullishLSQ += lowerAbsorption ? 15 : 0
+
+bullishLSQ += rsi15 <= rsiBullExtreme ? 10 : 0
+
+bullishLSQ += bullishDivergence ? 15 : 0
+
+bullishLSQ += closeUpperHalf ? 10 : 0
+
+bool validBuySideSweep  = rawBuySideSweep  and bearishLSQ >= minimumLSQ and (not requireDivergence or bearishDivergence)
+
+bool validSellSideSweep = rawSellSideSweep and bullishLSQ >= minimumLSQ and (not requireDivergence or bullishDivergence)
+
+//=============================================================================
+
+// HELPERS
+
+//=============================================================================
+
+f_line_value(int t1, float p1, int t2, float p2, int tx) =>
+
+    t2 == t1 ? p2 : p1 + (p2-p1) * (float(tx-t1) / float(t2-t1))
+
+f_best_line(int[] times, float[] prices, bool rising, float tolerance) =>
+
+    int bt1 = na
+
+    int bt2 = na
+
+    float bp1 = na
+
+    float bp2 = na
+
+    int bestTouches = 0
+
+    int n = array.size(times)
+
+    if n >= 2
+
+        for i = 0 to n-2
+
+            int t1x = array.get(times,i)
+
+            float p1x = array.get(prices,i)
+
+            for j = i+1 to n-1
+
+                int t2x = array.get(times,j)
+
+                float p2x = array.get(prices,j)
+
+                bool slopeOK = rising ? p2x >= p1x - tolerance : p2x <= p1x + tolerance
+
+                if slopeOK and t2x > t1x
+
+                    int touches = 0
+
+                    for k = 0 to n-1
+
+                        int tk = array.get(times,k)
+
+                        float pk = array.get(prices,k)
+
+                        float lv = f_line_value(t1x,p1x,t2x,p2x,tk)
+
+                        if math.abs(pk-lv) <= tolerance
+
+                            touches += 1
+
+                    if touches > bestTouches
+
+                        bestTouches := touches
+
+                        bt1 := t1x
+
+                        bt2 := t2x
+
+                        bp1 := p1x
+
+                        bp2 := p2x
+
+    [bt1,bp1,bt2,bp2,bestTouches]
+
+f_target_below(float a, float b, float px, float fallback) =>
+
+    float out = na
+
+    if not na(a) and a < px
+
+        out := a
+
+    if not na(b) and b < px and (na(out) or b > out)
+
+        out := b
+
+    if na(out) and not na(fallback) and fallback < px
+
+        out := fallback
+
+    out
+
+f_target_above(float a, float b, float px, float fallback) =>
+
+    float out = na
+
+    if not na(a) and a > px
+
+        out := a
+
+    if not na(b) and b > px and (na(out) or b < out)
+
+        out := b
+
+    if na(out) and not na(fallback) and fallback > px
+
+        out := fallback
+
+    out
+
+// Nearest confirmed external pool strictly beyond TP1. This is frozen at entry.
+f_external_above(float h0, float h1, float h2, float tp1) =>
+    float out = na
+    if not na(h0) and h0 > tp1
+        out := h0
+    if not na(h1) and h1 > tp1 and (na(out) or h1 < out)
+        out := h1
+    if not na(h2) and h2 > tp1 and (na(out) or h2 < out)
+        out := h2
+    out
+
+f_external_below(float l0, float l1, float l2, float tp1) =>
+    float out = na
+    if not na(l0) and l0 < tp1
+        out := l0
+    if not na(l1) and l1 < tp1 and (na(out) or l1 > out)
+        out := l1
+    if not na(l2) and l2 < tp1 and (na(out) or l2 > out)
+        out := l2
+    out
+
+f_valid_long_geometry(float entry, float stop, float tp1, float tp2) =>
+    bool base = not na(entry) and not na(stop) and not na(tp1) and stop < entry and entry < tp1
+    bool ext = na(tp2) or tp2 > tp1
+    base and ext
+
+f_valid_short_geometry(float entry, float stop, float tp1, float tp2) =>
+    bool base = not na(entry) and not na(stop) and not na(tp1) and tp1 < entry and entry < stop
+    bool ext = na(tp2) or tp2 < tp1
+    base and ext
+
+var line[] historyLines = array.new_line()
+
+var box[] historyBoxes = array.new_box()
+
+var label[] historyLabels = array.new_label()
+
+f_keep_line(line obj) =>
+
+    array.push(historyLines,obj)
+
+    if array.size(historyLines) > 300
+
+        line.delete(array.shift(historyLines))
+
+f_keep_box(box obj) =>
+
+    array.push(historyBoxes,obj)
+
+    if array.size(historyBoxes) > 120
+
+        box.delete(array.shift(historyBoxes))
+
+f_keep_label(label obj) =>
+
+    array.push(historyLabels,obj)
+
+    if array.size(historyLabels) > 300
+
+        label.delete(array.shift(historyLabels))
+
+//=============================================================================
+
+// MODEL STATE
+
+//=============================================================================
+
+var int bearStage = 0
+
+var int bullStage = 0
+
+var int bearSweepAge = 0
+
+var int bullSweepAge = 0
+
+var int bearModelAge = 0
+
+var int bullModelAge = 0
+
+var int bearSweepTime = na
+
+var int bullSweepTime = na
+
+var float bearSweepLevel = na
+
+var float bullSweepLevel = na
+var float bearSweepExtreme = na
+var float bullSweepExtreme = na
+
+var int bearModelLSQ = 0
+
+var int bullModelLSQ = 0
+
+var int bearDispTime = na
+
+var int bullDispTime = na
+
+var bool bearIFVGPending = false
+
+var bool bullIFVGPending = false
+
+var bool bearIFVGReady = false
+
+var bool bullIFVGReady = false
+
+var float bearIFVGTop = na
+
+var float bearIFVGBottom = na
+
+var float bullIFVGTop = na
+
+var float bullIFVGBottom = na
+
+var int[] bearTimes = array.new_int()
+
+var float[] bearPrices = array.new_float()
+
+var int[] bullTimes = array.new_int()
+
+var float[] bullPrices = array.new_float()
+
+var int bearT1=na
+
+var int bearT2=na
+
+var float bearP1=na
+
+var float bearP2=na
+
+var int bearTouches=0
+
+var int bullT1=na
+
+var int bullT2=na
+
+var float bullP1=na
+
+var float bullP2=na
+
+var int bullTouches=0
+
+var line activeBearTrend=na
+
+var line activeBullTrend=na
+
+var label activeBearTrendLabel=na
+
+var label activeBullTrendLabel=na
+
+var float lastBearExitLevel=na
+
+var float lastBullExitLevel=na
+
+var int lastBearConfirmTime=na
+
+var int lastBullConfirmTime=na
+
+var int[] shortPathTimes = array.new_int()
+
+var float[] shortPathPrices = array.new_float()
+
+var int[] longPathTimes = array.new_int()
+
+var float[] longPathPrices = array.new_float()
+
+var int shortPathT1 = na
+
+var int shortPathT2 = na
+
+var float shortPathP1 = na
+
+var float shortPathP2 = na
+
+var int shortPathTouches = 0
+
+var int longPathT1 = na
+
+var int longPathT2 = na
+
+var float longPathP1 = na
+
+var float longPathP2 = na
+
+var int longPathTouches = 0
+
+var line activeShortPath = na
+
+var line activeLongPath = na
+
+var int shortEntryTime = na
+
+var int longEntryTime = na
+
+var float shortEntryPrice = na
+
+var float longEntryPrice = na
+
+var bool shortExitSignal = false
+
+var bool longExitSignal = false
+var bool shortTargetHitSignal = false
+var bool longTargetHitSignal = false
+var bool shortStopHitSignal = false
+var bool longStopHitSignal = false
+
+var float shortStopPrice = na
+var float longStopPrice = na
+var float shortTargetPrice = na   // TP1
+var float longTargetPrice = na    // TP1
+var float shortTP2Price = na
+var float longTP2Price = na
+var bool shortTP1Touched = false
+var bool longTP1Touched = false
+var bool shortRunnerActive = false
+var bool longRunnerActive = false
+var bool shortTP2Touched = false
+var bool longTP2Touched = false
+var bool shortTP2HitSignal = false
+var bool longTP2HitSignal = false
+var float shortRiskPoints = na
+var float longRiskPoints = na
+var float shortRewardPoints = na
+var float longRewardPoints = na
+var float shortPlannedR = na
+var float longPlannedR = na
+
+var string shortTradeStatus = "IDLE"
+var string longTradeStatus = "IDLE"
+var string lastTradeDirection = "NONE"
+var float lastTradeEntry = na
+var float lastTradeStop = na
+var float lastTradeTarget = na
+var float lastTradeTP2 = na
+var float lastTradeTP2R = na
+var float lastTradeRisk = na
+var float lastTradeReward = na
+var float lastTradeR = na
+var int lastTradeLSQ = 0
+var string lastTradeStatus = "IDLE"
+var string lastTradePath = "NONE"
+var bool bearFailedPathArmed = false
+var bool bullFailedPathArmed = false
+var int bearFailedPathAge = 0
+var int bullFailedPathAge = 0
+var float bearFailedPathExtreme = na
+var float bullFailedPathExtreme = na
+var bool pathBShortSignal = false
+var bool pathBLongSignal = false
+var bool pathCShortSignal = false
+var bool pathCLongSignal = false
+var bool pathDShortSignal = false
+var bool pathDLongSignal = false
+
+//=============================================================================
+// V6.4 FIX2 - MODEL STATE & EXECUTION ENGINE
+// Candidate setup state is separate from the authoritative execution ticket.
+//=============================================================================
+int EXEC_IDLE   = 0
+int EXEC_ACTIVE = 1
+int EXEC_TP1    = 2
+int EXEC_RUNNER = 3
+int EXEC_CLOSED = 4
+
+var int sequenceCounter = 0
+var int bearSequenceId = 0
+var int bullSequenceId = 0
+var int activeSequenceId = 0
+var int lastTradeSequenceId = 0
+var int executionState = EXEC_IDLE
+var string executionDirection = "NONE"
+var string executionPath = "NONE"
+// Frozen-at-entry auction relationship. PATH A/B/C/D is a separate dimension.
+var int lastGemClassCode = 0
+var int lastGemParentDir = 0
+var int lastGemBridgeDir = 0
+var int lastGemChild5Dir = 0
+var int lastGemChild1Dir = 0
+var string lastGemBridgeName = "UNRESOLVED"
+var int lastGemSnapshotTime = na
+// FIX5.1 RESEARCH: immutable, FIX5-NATIVE diagnostics only; not suite GEM proof.
+// -1 LSQ / 0 timestamps denote NOT VERIFIED for independent Path B entries.
+var int lastGemNativeLsqAtEntry = -1
+var int lastGemNativeSweepTimeAtEntry = na
+var int lastGemNativeDispTimeAtEntry = na
+var bool lastGemNativeIFVGAtEntry = false
+var int lastGemNativeTouchesAtEntry = 0
+var string lastGemNativeEvidenceOrigin = "NO_ENTRY"
+
+
+f_exec_state_name(int st) =>
+    string stateName = "IDLE"
+    if st == EXEC_ACTIVE
+        stateName := "ACTIVE"
+    else if st == EXEC_TP1
+        stateName := "TP1 HIT - AWAIT ACCEPTANCE"
+    else if st == EXEC_RUNNER
+        stateName := "RUNNER ACTIVE"
+    else if st == EXEC_CLOSED
+        stateName := "CLOSED"
+    stateName
+
+// FIX5 - active authority cannot be displaced by a fresh sweep/candidate.
+f_ticket_open() =>
+    executionState == EXEC_ACTIVE or executionState == EXEC_TP1 or executionState == EXEC_RUNNER
+
+f_entry_available() =>
+    not blockConcurrentTrades or not f_ticket_open()
+
+// FIX2 NOTE:
+// Pine functions cannot modify global variables, so authoritative ticket-state
+// assignments are performed directly at each entry/exit call site.
+
+bool bearFinalSignal=false
+
+bool bullFinalSignal=false
+
+bool bearSweepEvent=false
+// Distinguishes a liquidity observation from a new candidate during an open ticket.
+bool bearSweepEvidenceOnly=false
+bool bullSweepEvidenceOnly=false
+
+bool bullSweepEvent=false
+
+//=============================================================================
+
+// MAIN ENGINE - only advances on completed anchor-TF updates
+
+//=============================================================================
+
+if new15
+    bearSweepEvidenceOnly := false
+    bullSweepEvidenceOnly := false
+
+    shortExitSignal := false
+
+    longExitSignal := false
+    shortTargetHitSignal := false
+    longTargetHitSignal := false
+    shortTP2HitSignal := false
+    longTP2HitSignal := false
+    shortStopHitSignal := false
+    longStopHitSignal := false
+    pathBShortSignal := false
+    pathBLongSignal := false
+    pathCShortSignal := false
+    pathCLongSignal := false
+    pathDShortSignal := false
+    pathDLongSignal := false
+
+    if bearFailedPathArmed
+        bearFailedPathAge += 1
+        if bearFailedPathAge > failedPathWindow
+            bearFailedPathArmed := false
+            bearFailedPathAge := 0
+
+    if bullFailedPathArmed
+        bullFailedPathAge += 1
+        if bullFailedPathAge > failedPathWindow
+            bullFailedPathArmed := false
+            bullFailedPathAge := 0
+
+    // Age / expiry
+
+    if bearStage == 1
+
+        bearSweepAge += 1
+
+        if bearSweepAge > sweepToDispBars
+
+            bearStage := 0
+
+    if bullStage == 1
+
+        bullSweepAge += 1
+
+        if bullSweepAge > sweepToDispBars
+
+            bullStage := 0
+
+    if bearStage >= 2 and bearStage < 5
+
+        bearModelAge += 1
+
+        if bearModelAge > modelTimeoutBars
+
+            bearStage := 0
+
+            bearIFVGPending := false
+
+            bearIFVGReady := false
+
+            array.clear(bearTimes)
+
+            array.clear(bearPrices)
+
+            if not na(activeBearTrend)
+
+                line.delete(activeBearTrend)
+
+                activeBearTrend := na
+
+            if not na(activeBearTrendLabel)
+
+                label.delete(activeBearTrendLabel)
+
+                activeBearTrendLabel := na
+
+    if bullStage >= 2 and bullStage < 5
+
+        bullModelAge += 1
+
+        if bullModelAge > modelTimeoutBars
+
+            bullStage := 0
+
+            bullIFVGPending := false
+
+            bullIFVGReady := false
+
+            array.clear(bullTimes)
+
+            array.clear(bullPrices)
+
+            if not na(activeBullTrend)
+
+                line.delete(activeBullTrend)
+
+                activeBullTrend := na
+
+            if not na(activeBullTrendLabel)
+
+                label.delete(activeBullTrendLabel)
+
+                activeBullTrendLabel := na
+
+    // New bearish-origin sweep. Progress lock prevents overwrite after displacement.
+
+    bool canTakeBearSweep = bearStage == 0 or bearStage == 5 or (bearStage == 1 and (not replaceSweepWithHigherLSQ or bearishLSQ >= bearModelLSQ)) or (not lockAfterDisplacement and bearStage >= 2 and bearStage < 5)
+
+    if detectBearish and validBuySideSweep and blockConcurrentTrades and f_ticket_open()
+        // Observation only. Do NOT advance an execution sequence, reset stage,
+        // mutate the originating sweep/LSQ or interrupt stop/target monitoring.
+        bearSweepEvent := true
+        bearSweepEvidenceOnly := true
+
+    if detectBearish and validBuySideSweep and canTakeBearSweep and (not blockConcurrentTrades or not f_ticket_open())
+
+        bearSweepEvent := true
+
+        sequenceCounter += 1
+        bearSequenceId := sequenceCounter
+
+        bearStage := 1
+
+        bearSweepAge := 0
+
+        bearModelAge := 0
+
+        bearSweepTime := t15
+
+        bearSweepLevel := swingHigh
+        bearSweepExtreme := h15
+
+        bearModelLSQ := bearishLSQ
+
+        bearDispTime := na
+
+        bearIFVGPending := false
+
+        bearIFVGReady := false
+
+        bearIFVGTop := na
+
+        bearIFVGBottom := na
+
+        array.clear(bearTimes)
+
+        array.clear(bearPrices)
+
+        if not na(activeBearTrend)
+
+            line.delete(activeBearTrend)
+
+            activeBearTrend := na
+
+        if not na(activeBearTrendLabel)
+
+            label.delete(activeBearTrendLabel)
+
+            activeBearTrendLabel := na
+
+        if showSweep
+
+            line sl = line.new(t15,bearSweepLevel,tc15 + 8*barMs,bearSweepLevel,xloc=xloc.bar_time,color=sweepColor,width=2)
+
+            f_keep_line(sl)
+
+        if showLSQ
+
+            string txt = bearishLSQ >= fullSweepLabelLSQ ? "BUY-SIDE SWEEP\nLSQ " + str.tostring(bearishLSQ) + "/100" : "LSQ " + str.tostring(bearishLSQ)
+
+            if bearishLSQ >= fullSweepLabelLSQ or showLowScoreSweepMarkers
+
+                label lb = label.new(t15,h15,txt,xloc=xloc.bar_time,yloc=yloc.price,style=label.style_label_down,color=sweepColor,textcolor=color.black,size=size.tiny)
+
+                f_keep_label(lb)
+
+    // New bullish-origin sweep.
+
+    bool canTakeBullSweep = bullStage == 0 or bullStage == 5 or (bullStage == 1 and (not replaceSweepWithHigherLSQ or bullishLSQ >= bullModelLSQ)) or (not lockAfterDisplacement and bullStage >= 2 and bullStage < 5)
+
+    if detectBullish and validSellSideSweep and blockConcurrentTrades and f_ticket_open()
+        // Observation only: active ticket retains its ownership and trade inputs.
+        bullSweepEvent := true
+        bullSweepEvidenceOnly := true
+
+    if detectBullish and validSellSideSweep and canTakeBullSweep and (not blockConcurrentTrades or not f_ticket_open())
+
+        bullSweepEvent := true
+
+        sequenceCounter += 1
+        bullSequenceId := sequenceCounter
+
+        bullStage := 1
+
+        bullSweepAge := 0
+
+        bullModelAge := 0
+
+        bullSweepTime := t15
+
+        bullSweepLevel := swingLow
+        bullSweepExtreme := l15
+
+        bullModelLSQ := bullishLSQ
+
+        bullDispTime := na
+
+        bullIFVGPending := false
+
+        bullIFVGReady := false
+
+        bullIFVGTop := na
+
+        bullIFVGBottom := na
+
+        array.clear(bullTimes)
+
+        array.clear(bullPrices)
+
+        if not na(activeBullTrend)
+
+            line.delete(activeBullTrend)
+
+            activeBullTrend := na
+
+        if not na(activeBullTrendLabel)
+
+            label.delete(activeBullTrendLabel)
+
+            activeBullTrendLabel := na
+
+        if showSweep
+
+            line sl = line.new(t15,bullSweepLevel,tc15 + 8*barMs,bullSweepLevel,xloc=xloc.bar_time,color=sweepColor,width=2)
+
+            f_keep_line(sl)
+
+        if showLSQ
+
+            string txt = bullishLSQ >= fullSweepLabelLSQ ? "SELL-SIDE SWEEP\nLSQ " + str.tostring(bullishLSQ) + "/100" : "LSQ " + str.tostring(bullishLSQ)
+
+            if bullishLSQ >= fullSweepLabelLSQ or showLowScoreSweepMarkers
+
+                label lb = label.new(t15,l15,txt,xloc=xloc.bar_time,yloc=yloc.price,style=label.style_label_up,color=sweepColor,textcolor=color.black,size=size.tiny)
+
+                f_keep_label(lb)
+
+    // Displacement + BOS
+
+    float body = math.abs(c15-o15)
+
+    bool bearishDisp = bearStage == 1 and c15 < o15 and body >= atr15*minimumDispATR and c15 < localLow15
+
+    bool bullishDisp = bullStage == 1 and c15 > o15 and body >= atr15*minimumDispATR and c15 > localHigh15
+
+    if bearishDisp
+
+        bearStage := 2
+
+        bearModelAge := 0
+
+        bearDispTime := t15
+
+        bearIFVGPending := true
+
+        array.clear(bearTimes)
+
+        array.clear(bearPrices)
+
+        if not na(trendPL15)
+
+            array.push(bearTimes,t15 - trendPivotLength*barMs)
+
+            array.push(bearPrices,trendPL15)
+
+        if debugMode
+
+            label db=label.new(t15,l15,"BEAR DISP + BOS\nLSQ "+str.tostring(bearModelLSQ),xloc=xloc.bar_time,style=label.style_label_down,color=color.red,textcolor=color.white,size=size.tiny)
+
+            f_keep_label(db)
+
+    if bullishDisp
+
+        bullStage := 2
+
+        bullModelAge := 0
+
+        bullDispTime := t15
+
+        bullIFVGPending := true
+
+        array.clear(bullTimes)
+
+        array.clear(bullPrices)
+
+        if not na(trendPH15)
+
+            array.push(bullTimes,t15 - trendPivotLength*barMs)
+
+            array.push(bullPrices,trendPH15)
+
+        if debugMode
+
+            label db=label.new(t15,h15,"BULL DISP + BOS\nLSQ "+str.tostring(bullModelLSQ),xloc=xloc.bar_time,style=label.style_label_up,color=color.green,textcolor=color.white,size=size.tiny)
+
+            f_keep_label(db)
+
+    // IFVG: evaluate the three-bar overlap on the bar after displacement.
+
+    if bearIFVGPending and bearDispTime == tPrev
+
+        float middleLow = math.min(oPrev,cPrev)
+
+        float middleHigh= math.max(oPrev,cPrev)
+
+        float zBottom = math.max(math.max(lTwo,l15),middleLow)
+
+        float zTop = math.min(math.min(hTwo,h15),middleHigh)
+
+        float zSize=zTop-zBottom
+
+        bool valid=zTop>zBottom and zSize<=atr15*maxIFVGATR
+
+        if valid
+
+            bearIFVGReady:=true
+
+            bearIFVGTop:=zTop
+
+            bearIFVGBottom:=zBottom
+
+            bearStage:=3
+
+            if showIFVG
+
+                box bx=box.new(tTwo,zTop,tc15+ifvgExtendBars*barMs,zBottom,xloc=xloc.bar_time,border_color=ifvgColor,bgcolor=color.new(ifvgColor,75))
+
+                f_keep_box(bx)
+
+                label il=label.new(t15,zTop,"IFVG",xloc=xloc.bar_time,style=label.style_label_down,color=ifvgColor,textcolor=color.black,size=size.tiny)
+
+                f_keep_label(il)
+
+        bearIFVGPending:=false
+
+    if bullIFVGPending and bullDispTime == tPrev
+
+        float middleLow = math.min(oPrev,cPrev)
+
+        float middleHigh= math.max(oPrev,cPrev)
+
+        float zBottom = math.max(math.max(lTwo,l15),middleLow)
+
+        float zTop = math.min(math.min(hTwo,h15),middleHigh)
+
+        float zSize=zTop-zBottom
+
+        bool valid=zTop>zBottom and zSize<=atr15*maxIFVGATR
+
+        if valid
+
+            bullIFVGReady:=true
+
+            bullIFVGTop:=zTop
+
+            bullIFVGBottom:=zBottom
+
+            bullStage:=3
+
+            if showIFVG
+
+                box bx=box.new(tTwo,zTop,tc15+ifvgExtendBars*barMs,zBottom,xloc=xloc.bar_time,border_color=ifvgColor,bgcolor=color.new(ifvgColor,75))
+
+                f_keep_box(bx)
+
+                label il=label.new(t15,zBottom,"IFVG",xloc=xloc.bar_time,style=label.style_label_up,color=ifvgColor,textcolor=color.black,size=size.tiny)
+
+                f_keep_label(il)
+
+        bullIFVGPending:=false
+
+    // Collect post-displacement liquidity pivots.
+
+    if bearStage >= 2 and bearStage < 5 and not na(trendPL15)
+
+        int pt=t15-trendPivotLength*barMs
+
+        if pt > nz(bearDispTime,0)
+
+            bool duplicate=array.size(bearTimes)>0 and array.get(bearTimes,array.size(bearTimes)-1)==pt
+
+            if not duplicate
+
+                array.push(bearTimes,pt)
+
+                array.push(bearPrices,trendPL15)
+
+                if array.size(bearTimes)>maxTrendPoints
+
+                    array.shift(bearTimes)
+
+                    array.shift(bearPrices)
+
+    if bullStage >= 2 and bullStage < 5 and not na(trendPH15)
+
+        int pt=t15-trendPivotLength*barMs
+
+        if pt > nz(bullDispTime,0)
+
+            bool duplicate=array.size(bullTimes)>0 and array.get(bullTimes,array.size(bullTimes)-1)==pt
+
+            if not duplicate
+
+                array.push(bullTimes,pt)
+
+                array.push(bullPrices,trendPH15)
+
+                if array.size(bullTimes)>maxTrendPoints
+
+                    array.shift(bullTimes)
+
+                    array.shift(bullPrices)
+
+    // Re-score best trendline each anchor bar.
+
+    if bearStage >= 2 and bearStage < 5 and array.size(bearTimes)>=2
+
+        [x1,y1,x2,y2,touches]=f_best_line(bearTimes,bearPrices,true,trendTouchTolerance)
+
+        bearT1:=x1
+
+        bearP1:=y1
+
+        bearT2:=x2
+
+        bearP2:=y2
+
+        bearTouches:=touches
+
+        if touches>=minimumTrendTouches
+
+            bearStage:=4
+
+        if not na(activeBearTrend)
+
+            line.delete(activeBearTrend)
+
+            activeBearTrend:=na
+
+        if not na(activeBearTrendLabel)
+
+            label.delete(activeBearTrendLabel)
+
+            activeBearTrendLabel:=na
+
+        bool display=touches>=minimumTrendTouches or (showTwoTouchCandidates and touches>=2)
+
+        if showTrendline and display and not na(x1) and not na(x2)
+
+            int proj=tc15+trendProjectionBars*barMs
+
+            float py=f_line_value(x1,y1,x2,y2,proj)
+
+            activeBearTrend:=line.new(x1,y1,proj,py,xloc=xloc.bar_time,color=trendColor,width=touches>=4?4:touches==3?3:2)
+
+            float now=f_line_value(x1,y1,x2,y2,t15)
+
+            activeBearTrendLabel:=label.new(t15,now,"LIQUIDITY LINE\n"+str.tostring(touches)+" TOUCHES",xloc=xloc.bar_time,style=label.style_label_up,color=trendColor,textcolor=color.white,size=size.tiny)
+
+    if bullStage >= 2 and bullStage < 5 and array.size(bullTimes)>=2
+
+        [x1,y1,x2,y2,touches]=f_best_line(bullTimes,bullPrices,false,trendTouchTolerance)
+
+        bullT1:=x1
+
+        bullP1:=y1
+
+        bullT2:=x2
+
+        bullP2:=y2
+
+        bullTouches:=touches
+
+        if touches>=minimumTrendTouches
+
+            bullStage:=4
+
+        if not na(activeBullTrend)
+
+            line.delete(activeBullTrend)
+
+            activeBullTrend:=na
+
+        if not na(activeBullTrendLabel)
+
+            label.delete(activeBullTrendLabel)
+
+            activeBullTrendLabel:=na
+
+        bool display=touches>=minimumTrendTouches or (showTwoTouchCandidates and touches>=2)
+
+        if showTrendline and display and not na(x1) and not na(x2)
+
+            int proj=tc15+trendProjectionBars*barMs
+
+            float py=f_line_value(x1,y1,x2,y2,proj)
+
+            activeBullTrend:=line.new(x1,y1,proj,py,xloc=xloc.bar_time,color=trendColor,width=touches>=4?4:touches==3?3:2)
+
+            float now=f_line_value(x1,y1,x2,y2,t15)
+
+            activeBullTrendLabel:=label.new(t15,now,"LIQUIDITY LINE\n"+str.tostring(touches)+" TOUCHES",xloc=xloc.bar_time,style=label.style_label_down,color=trendColor,textcolor=color.white,size=size.tiny)
+
+    // Final breaks.
+
+    if bearStage==4 and bearTouches>=minimumTrendTouches and not na(bearT1) and not na(bearT2)
+
+        float lineNow=f_line_value(bearT1,bearP1,bearT2,bearP2,t15)
+
+        float linePrev=f_line_value(bearT1,bearP1,bearT2,bearP2,tPrev)
+
+        bool broke=requireCloseBreak ? c15 < lineNow-trendBreakTolerance : l15 < lineNow-trendBreakTolerance
+
+        bool wasAbove=cPrev >= linePrev-trendBreakTolerance
+
+        bool ifvgOK=not requireIFVGForFinal or bearIFVGReady
+
+        bool geometryOK = not enforceTradeGeometry or f_valid_short_geometry(c15,bearSweepExtreme,f_target_below(swingLow,oldSwingLow,c15,fallbackTargetLow),enableTargetExtension ? f_external_below(extLow0,extLow1,extLow2,f_target_below(swingLow,oldSwingLow,c15,fallbackTargetLow)) : na)
+        if broke and wasAbove and ifvgOK and enablePathA and geometryOK and f_entry_available() and f_gem_entry_allowed(-1)
+
+            bearFinalSignal:=true
+
+            bearStage:=5
+
+            shortEntryTime := t15
+
+            shortEntryPrice := c15
+
+            array.clear(shortPathTimes)
+
+            array.clear(shortPathPrices)
+
+            shortPathT1 := na
+
+            shortPathT2 := na
+
+            shortPathP1 := na
+
+            shortPathP2 := na
+
+            shortPathTouches := 0
+
+            if not na(activeShortPath)
+
+                line.delete(activeShortPath)
+
+                activeShortPath := na
+
+            lastBearConfirmTime:=t15
+
+            lastBearExitLevel:=f_target_below(swingLow,oldSwingLow,c15,fallbackTargetLow)
+            shortStopPrice := bearSweepExtreme
+            shortTargetPrice := lastBearExitLevel
+            shortTP2Price := enableTargetExtension and not na(shortTargetPrice) ? f_external_below(extLow0,extLow1,extLow2,shortTargetPrice) : na
+            shortTP1Touched := false
+            shortRunnerActive := false
+            shortTP2Touched := false
+            shortRiskPoints := not na(shortStopPrice) ? shortStopPrice - shortEntryPrice : na
+            shortRewardPoints := not na(shortTargetPrice) ? shortEntryPrice - shortTargetPrice : na
+            shortPlannedR := not na(shortRiskPoints) and shortRiskPoints > 0 and not na(shortRewardPoints) and shortRewardPoints > 0 ? shortRewardPoints / shortRiskPoints : na
+            shortTradeStatus := "SHORT ACTIVE"
+            lastTradePath := "A - PRIMARY REVERSAL"
+            activeSequenceId := bearSequenceId
+            lastTradeSequenceId := bearSequenceId
+            executionDirection := "SHORT"
+            executionPath := lastTradePath
+            executionState := EXEC_ACTIVE
+            lastGemClassCode := f_gem_class_code(-1)
+            lastGemParentDir := gemParentDir
+            lastGemBridgeDir := gemBridgeDir
+            lastGemChild5Dir := gemChild5
+            lastGemChild1Dir := gemChild1
+            lastGemBridgeName := f_gem_bridge_name(-1)
+            lastGemSnapshotTime := t15
+            lastGemNativeLsqAtEntry := bearModelLSQ
+            lastGemNativeSweepTimeAtEntry := bearSweepTime
+            lastGemNativeDispTimeAtEntry := bearDispTime
+            lastGemNativeIFVGAtEntry := bearIFVGReady
+            lastGemNativeTouchesAtEntry := bearTouches
+            lastGemNativeEvidenceOrigin := "FIX5_A_NATIVE_ONLY"
+            lastTradeDirection := "SHORT"
+            lastTradeEntry := shortEntryPrice
+            lastTradeStop := shortStopPrice
+            lastTradeTarget := shortTargetPrice
+            lastTradeTP2 := shortTP2Price
+            lastTradeTP2R := not na(shortRiskPoints) and shortRiskPoints > 0 and not na(shortTP2Price) ? (shortEntryPrice-shortTP2Price)/shortRiskPoints : na
+            lastTradeRisk := shortRiskPoints
+            lastTradeReward := shortRewardPoints
+            lastTradeR := shortPlannedR
+            lastTradeLSQ := bearModelLSQ
+            lastTradeStatus := shortTradeStatus
+            if showTradeLevels
+                int trt = t15 + targetLineBars * barMs
+                line el = line.new(t15,shortEntryPrice,trt,shortEntryPrice,xloc=xloc.bar_time,color=color.green,width=2)
+                line sl = line.new(t15,shortStopPrice,trt,shortStopPrice,xloc=xloc.bar_time,color=color.red,width=2)
+                f_keep_line(el)
+                f_keep_line(sl)
+                if not na(shortTargetPrice)
+                    line tl2 = line.new(t15,shortTargetPrice,trt,shortTargetPrice,xloc=xloc.bar_time,color=color.lime,width=2)
+                    f_keep_line(tl2)
+                if showTP2Targets and not na(shortTP2Price)
+                    line xt2 = line.new(t15,shortTP2Price,trt,shortTP2Price,xloc=xloc.bar_time,color=color.aqua,width=2,style=line.style_dashed)
+                    f_keep_line(xt2)
+
+            if not na(activeBearTrend)
+
+                if completedTrendlineMode=="Extend Right"
+
+                    line.set_extend(activeBearTrend,extend.right)
+
+                else
+
+                    int rt=t15+completedTrendlineBars*barMs
+
+                    line.set_extend(activeBearTrend,extend.none)
+
+                    line.set_x2(activeBearTrend,rt)
+
+                    line.set_y2(activeBearTrend,f_line_value(bearT1,bearP1,bearT2,bearP2,rt))
+
+                if keepCompletedTrendlines
+
+                    f_keep_line(activeBearTrend)
+
+                else
+
+                    line.delete(activeBearTrend)
+
+                activeBearTrend:=na
+
+            if not na(activeBearTrendLabel)
+
+                label.delete(activeBearTrendLabel)
+
+                activeBearTrendLabel:=na
+
+            if showFinalLabels
+
+                label cf=label.new(t15,lineNow,"PATH A SHORT" + (showSequenceOnLabels ? "\nSEQ #" + str.tostring(bearSequenceId) : "") + "\nLSQ "+str.tostring(bearModelLSQ)+"/100",xloc=xloc.bar_time,style=label.style_label_down,color=color.red,textcolor=color.white,size=size.small)
+
+                f_keep_label(cf)
+
+            if showTargets and not na(lastBearExitLevel)
+
+                int rt=t15+targetLineBars*barMs
+
+                line tl=line.new(t15,lastBearExitLevel,rt,lastBearExitLevel,xloc=xloc.bar_time,color=exitColor,width=3)
+
+                f_keep_line(tl)
+
+                label et=label.new(rt,lastBearExitLevel,"EXIT KEY LEVEL\nSHORT MODEL",xloc=xloc.bar_time,style=label.style_label_left,color=exitColor,textcolor=color.white)
+
+                f_keep_label(et)
+
+    if bullStage==4 and bullTouches>=minimumTrendTouches and not na(bullT1) and not na(bullT2)
+
+        float lineNow=f_line_value(bullT1,bullP1,bullT2,bullP2,t15)
+
+        float linePrev=f_line_value(bullT1,bullP1,bullT2,bullP2,tPrev)
+
+        bool broke=requireCloseBreak ? c15 > lineNow+trendBreakTolerance : h15 > lineNow+trendBreakTolerance
+
+        bool wasBelow=cPrev <= linePrev+trendBreakTolerance
+
+        bool ifvgOK=not requireIFVGForFinal or bullIFVGReady
+
+        bool geometryOK = not enforceTradeGeometry or f_valid_long_geometry(c15,bullSweepExtreme,f_target_above(swingHigh,oldSwingHigh,c15,fallbackTargetHigh),enableTargetExtension ? f_external_above(extHigh0,extHigh1,extHigh2,f_target_above(swingHigh,oldSwingHigh,c15,fallbackTargetHigh)) : na)
+        if broke and wasBelow and ifvgOK and enablePathA and geometryOK and f_entry_available() and f_gem_entry_allowed(1)
+
+            bullFinalSignal:=true
+
+            bullStage:=5
+
+            longEntryTime := t15
+
+            longEntryPrice := c15
+
+            array.clear(longPathTimes)
+
+            array.clear(longPathPrices)
+
+            longPathT1 := na
+
+            longPathT2 := na
+
+            longPathP1 := na
+
+            longPathP2 := na
+
+            longPathTouches := 0
+
+            if not na(activeLongPath)
+
+                line.delete(activeLongPath)
+
+                activeLongPath := na
+
+            lastBullConfirmTime:=t15
+
+            lastBullExitLevel:=f_target_above(swingHigh,oldSwingHigh,c15,fallbackTargetHigh)
+            longStopPrice := bullSweepExtreme
+            longTargetPrice := lastBullExitLevel
+            longTP2Price := enableTargetExtension and not na(longTargetPrice) ? f_external_above(extHigh0,extHigh1,extHigh2,longTargetPrice) : na
+            longTP1Touched := false
+            longRunnerActive := false
+            longTP2Touched := false
+            longRiskPoints := not na(longStopPrice) ? longEntryPrice - longStopPrice : na
+            longRewardPoints := not na(longTargetPrice) ? longTargetPrice - longEntryPrice : na
+            longPlannedR := not na(longRiskPoints) and longRiskPoints > 0 and not na(longRewardPoints) and longRewardPoints > 0 ? longRewardPoints / longRiskPoints : na
+            longTradeStatus := "LONG ACTIVE"
+            lastTradePath := "A - PRIMARY REVERSAL"
+            activeSequenceId := bullSequenceId
+            lastTradeSequenceId := bullSequenceId
+            executionDirection := "LONG"
+            executionPath := lastTradePath
+            executionState := EXEC_ACTIVE
+            lastGemClassCode := f_gem_class_code(1)
+            lastGemParentDir := gemParentDir
+            lastGemBridgeDir := gemBridgeDir
+            lastGemChild5Dir := gemChild5
+            lastGemChild1Dir := gemChild1
+            lastGemBridgeName := f_gem_bridge_name(1)
+            lastGemSnapshotTime := t15
+            lastGemNativeLsqAtEntry := bullModelLSQ
+            lastGemNativeSweepTimeAtEntry := bullSweepTime
+            lastGemNativeDispTimeAtEntry := bullDispTime
+            lastGemNativeIFVGAtEntry := bullIFVGReady
+            lastGemNativeTouchesAtEntry := bullTouches
+            lastGemNativeEvidenceOrigin := "FIX5_A_NATIVE_ONLY"
+            lastTradeDirection := "LONG"
+            lastTradeEntry := longEntryPrice
+            lastTradeStop := longStopPrice
+            lastTradeTarget := longTargetPrice
+            lastTradeTP2 := longTP2Price
+            lastTradeTP2R := not na(longRiskPoints) and longRiskPoints > 0 and not na(longTP2Price) ? (longTP2Price-longEntryPrice)/longRiskPoints : na
+            lastTradeRisk := longRiskPoints
+            lastTradeReward := longRewardPoints
+            lastTradeR := longPlannedR
+            lastTradeLSQ := bullModelLSQ
+            lastTradeStatus := longTradeStatus
+            if showTradeLevels
+                int trt = t15 + targetLineBars * barMs
+                line el = line.new(t15,longEntryPrice,trt,longEntryPrice,xloc=xloc.bar_time,color=color.green,width=2)
+                line sl = line.new(t15,longStopPrice,trt,longStopPrice,xloc=xloc.bar_time,color=color.red,width=2)
+                f_keep_line(el)
+                f_keep_line(sl)
+                if not na(longTargetPrice)
+                    line tl2 = line.new(t15,longTargetPrice,trt,longTargetPrice,xloc=xloc.bar_time,color=color.lime,width=2)
+                    f_keep_line(tl2)
+                if showTP2Targets and not na(longTP2Price)
+                    line xt2 = line.new(t15,longTP2Price,trt,longTP2Price,xloc=xloc.bar_time,color=color.aqua,width=2,style=line.style_dashed)
+                    f_keep_line(xt2)
+
+            if not na(activeBullTrend)
+
+                if completedTrendlineMode=="Extend Right"
+
+                    line.set_extend(activeBullTrend,extend.right)
+
+                else
+
+                    int rt=t15+completedTrendlineBars*barMs
+
+                    line.set_extend(activeBullTrend,extend.none)
+
+                    line.set_x2(activeBullTrend,rt)
+
+                    line.set_y2(activeBullTrend,f_line_value(bullT1,bullP1,bullT2,bullP2,rt))
+
+                if keepCompletedTrendlines
+
+                    f_keep_line(activeBullTrend)
+
+                else
+
+                    line.delete(activeBullTrend)
+
+                activeBullTrend:=na
+
+            if not na(activeBullTrendLabel)
+
+                label.delete(activeBullTrendLabel)
+
+                activeBullTrendLabel:=na
+
+            if showFinalLabels
+
+                label cf=label.new(t15,lineNow,"PATH A LONG" + (showSequenceOnLabels ? "\nSEQ #" + str.tostring(bullSequenceId) : "") + "\nLSQ "+str.tostring(bullModelLSQ)+"/100",xloc=xloc.bar_time,style=label.style_label_up,color=color.green,textcolor=color.white,size=size.small)
+
+                f_keep_label(cf)
+
+            if showTargets and not na(lastBullExitLevel)
+
+                int rt=t15+targetLineBars*barMs
+
+                line tl=line.new(t15,lastBullExitLevel,rt,lastBullExitLevel,xloc=xloc.bar_time,color=exitColor,width=3)
+
+                f_keep_line(tl)
+
+                label et=label.new(rt,lastBullExitLevel,"EXIT KEY LEVEL\nLONG MODEL",xloc=xloc.bar_time,style=label.style_label_left,color=exitColor,textcolor=color.white)
+
+                f_keep_label(et)
+
+    //=========================================================================
+
+    // V6.2 ACTIVE TRADE PATH
+
+    // A new path begins only AFTER entry. It never inherits the setup line.
+
+    // LONG path = best rising/equal-low line from post-entry confirmed pivot lows.
+
+    // SHORT path = best falling/equal-high line from post-entry confirmed pivot highs.
+
+    //=========================================================================
+
+    float pathTolerance = atr15 * pathTouchATR
+
+    if bearStage == 5 and not na(shortEntryTime) and not na(pathPH15)
+
+        int pt = t15 - pathPivotLength * barMs
+
+        if pt > shortEntryTime
+
+            bool duplicate = array.size(shortPathTimes) > 0 and array.get(shortPathTimes, array.size(shortPathTimes)-1) == pt
+
+            if not duplicate
+
+                array.push(shortPathTimes, pt)
+
+                array.push(shortPathPrices, pathPH15)
+
+                if array.size(shortPathTimes) > pathMaxPoints
+
+                    array.shift(shortPathTimes)
+
+                    array.shift(shortPathPrices)
+
+    if bullStage == 5 and not na(longEntryTime) and not na(pathPL15)
+
+        int pt = t15 - pathPivotLength * barMs
+
+        if pt > longEntryTime
+
+            bool duplicate = array.size(longPathTimes) > 0 and array.get(longPathTimes, array.size(longPathTimes)-1) == pt
+
+            if not duplicate
+
+                array.push(longPathTimes, pt)
+
+                array.push(longPathPrices, pathPL15)
+
+                if array.size(longPathTimes) > pathMaxPoints
+
+                    array.shift(longPathTimes)
+
+                    array.shift(longPathPrices)
+
+    if bearStage == 5 and array.size(shortPathTimes) >= 2
+
+        [px1,py1,px2,py2,ptouches] = f_best_line(shortPathTimes, shortPathPrices, false, pathTolerance)
+
+        shortPathT1 := px1
+
+        shortPathP1 := py1
+
+        shortPathT2 := px2
+
+        shortPathP2 := py2
+
+        shortPathTouches := ptouches
+
+        if not na(activeShortPath)
+
+            line.delete(activeShortPath)
+
+            activeShortPath := na
+
+        if showTradePath and ptouches >= pathMinimumTouches and not na(px1) and not na(px2)
+
+            int proj = tc15 + pathProjectionBars * barMs
+
+            float py = f_line_value(px1,py1,px2,py2,proj)
+
+            activeShortPath := line.new(px1,py1,proj,py,xloc=xloc.bar_time,color=trendColor,width=3)
+
+    if bullStage == 5 and array.size(longPathTimes) >= 2
+
+        [px1,py1,px2,py2,ptouches] = f_best_line(longPathTimes, longPathPrices, true, pathTolerance)
+
+        longPathT1 := px1
+
+        longPathP1 := py1
+
+        longPathT2 := px2
+
+        longPathP2 := py2
+
+        longPathTouches := ptouches
+
+        if not na(activeLongPath)
+
+            line.delete(activeLongPath)
+
+            activeLongPath := na
+
+        if showTradePath and ptouches >= pathMinimumTouches and not na(px1) and not na(px2)
+
+            int proj = tc15 + pathProjectionBars * barMs
+
+            float py = f_line_value(px1,py1,px2,py2,proj)
+
+            activeLongPath := line.new(px1,py1,proj,py,xloc=xloc.bar_time,color=trendColor,width=3)
+
+    // V6.3 target resolution.
+    // TP1 is the conservative opposing-liquidity payment.
+    // A later full-body acceptance beyond TP1 promotes the trade to the frozen external 1H TP2.
+    // The originating sweep extreme remains the hard invalidation throughout.
+    // Monitor the authoritative trade even if candidate-stage bookkeeping drifts.
+    if (bearStage == 5 or (executionDirection == "SHORT" and f_ticket_open())) and not na(shortEntryTime) and t15 > shortEntryTime
+        bool shortStopHit = not na(shortStopPrice) and h15 >= shortStopPrice
+        bool shortTP1Now = not shortTP1Touched and not na(shortTargetPrice) and l15 <= shortTargetPrice
+        bool shortAccept = shortTP1Touched and (requireTP1Acceptance ? (o15 < shortTargetPrice and c15 < shortTargetPrice) : c15 < shortTargetPrice)
+        bool shortTP2Now = shortRunnerActive and not shortTP2Touched and not na(shortTP2Price) and l15 <= shortTP2Price
+
+        if shortStopHit
+            shortStopHitSignal := true
+            if executionDirection == "SHORT"
+                executionState := EXEC_CLOSED
+                activeSequenceId := 0
+            shortTradeStatus := "STOP HIT"
+            lastTradeStatus := shortTradeStatus
+            label sh = label.new(t15,shortStopPrice,"EXIT SHORT\nSWEEP INVALIDATION",xloc=xloc.bar_time,yloc=yloc.price,style=label.style_label_down,color=color.red,textcolor=color.white,size=size.small)
+            f_keep_label(sh)
+            if not na(activeShortPath)
+                f_keep_line(activeShortPath)
+                activeShortPath := na
+            bearStage := 0
+            shortEntryTime := na
+            array.clear(shortPathTimes)
+            array.clear(shortPathPrices)
+            shortPathTouches := 0
+        else
+            if shortTP1Now
+                shortTP1Touched := true
+                shortTargetHitSignal := true
+                if executionDirection == "SHORT"
+                    executionState := EXEC_TP1
+                shortTradeStatus := enableTargetExtension and not na(shortTP2Price) ? "TP1 HIT - AWAIT ACCEPTANCE" : "TP1 HIT"
+                lastTradeStatus := shortTradeStatus
+                if showTargetHitLabels
+                    label th = label.new(t15,shortTargetPrice,"SHORT TP1 HIT\nCONSERVATIVE LIQUIDITY",xloc=xloc.bar_time,yloc=yloc.price,style=label.style_label_up,color=color.lime,textcolor=color.black,size=size.small)
+                    f_keep_label(th)
+                if not enableTargetExtension or na(shortTP2Price)
+                    // TP1 is terminal only when no TP2 extension exists.
+                    if executionDirection == "SHORT"
+                        executionState := EXEC_CLOSED
+                        activeSequenceId := 0
+                    if not na(activeShortPath)
+                        f_keep_line(activeShortPath)
+                        activeShortPath := na
+                    bearStage := 0
+                    shortEntryTime := na
+                    array.clear(shortPathTimes)
+                    array.clear(shortPathPrices)
+                    shortPathTouches := 0
+            if (bearStage == 5 or (executionDirection == "SHORT" and f_ticket_open())) and shortAccept and enableTargetExtension and not na(shortTP2Price) and not shortRunnerActive
+                shortRunnerActive := true
+                pathCShortSignal := enablePathC
+                if enablePathC
+                    lastTradePath := "C - TP1 CONTINUATION"
+                    executionPath := lastTradePath
+                    executionState := EXEC_RUNNER
+                    if showPathModelLabels
+                        label pc = label.new(t15,shortTargetPrice,"PATH C SHORT\nTP1 CONTINUATION",xloc=xloc.bar_time,style=label.style_label_up,color=color.aqua,textcolor=color.black,size=size.tiny)
+                        f_keep_label(pc)
+                shortTradeStatus := "TP1 ACCEPTED - RUNNER ACTIVE"
+                lastTradeStatus := shortTradeStatus
+                if showTargetHitLabels
+                    label ra = label.new(t15,shortTargetPrice,"SHORT RUNNER ACTIVE\nTP2: 1H SELL-SIDE LIQUIDITY",xloc=xloc.bar_time,yloc=yloc.price,style=label.style_label_up,color=color.aqua,textcolor=color.black,size=size.tiny)
+                    f_keep_label(ra)
+            if (bearStage == 5 or (executionDirection == "SHORT" and f_ticket_open())) and shortTP2Now
+                shortTP2Touched := true
+                shortTP2HitSignal := true
+                shortTradeStatus := keepRunnerAfterTP2 ? "TP2 HIT - PATH RUNNER" : "TP2 HIT"
+                lastTradeStatus := shortTradeStatus
+                if showTargetHitLabels
+                    label t2h = label.new(t15,shortTP2Price,"SHORT TP2 HIT\nEXTERNAL 1H LIQUIDITY",xloc=xloc.bar_time,yloc=yloc.price,style=label.style_label_up,color=color.aqua,textcolor=color.black,size=size.small)
+                    f_keep_label(t2h)
+                if not keepRunnerAfterTP2
+                    if executionDirection == "SHORT"
+                        executionState := EXEC_CLOSED
+                        activeSequenceId := 0
+                    if not na(activeShortPath)
+                        f_keep_line(activeShortPath)
+                        activeShortPath := na
+                    bearStage := 0
+                    shortEntryTime := na
+                    array.clear(shortPathTimes)
+                    array.clear(shortPathPrices)
+                    shortPathTouches := 0
+
+    if (bullStage == 5 or (executionDirection == "LONG" and f_ticket_open())) and not na(longEntryTime) and t15 > longEntryTime
+        bool longStopHit = not na(longStopPrice) and l15 <= longStopPrice
+        bool longTP1Now = not longTP1Touched and not na(longTargetPrice) and h15 >= longTargetPrice
+        bool longAccept = longTP1Touched and (requireTP1Acceptance ? (o15 > longTargetPrice and c15 > longTargetPrice) : c15 > longTargetPrice)
+        bool longTP2Now = longRunnerActive and not longTP2Touched and not na(longTP2Price) and h15 >= longTP2Price
+
+        if longStopHit
+            longStopHitSignal := true
+            if executionDirection == "LONG"
+                executionState := EXEC_CLOSED
+                activeSequenceId := 0
+            longTradeStatus := "STOP HIT"
+            lastTradeStatus := longTradeStatus
+            label sh = label.new(t15,longStopPrice,"EXIT LONG\nSWEEP INVALIDATION",xloc=xloc.bar_time,yloc=yloc.price,style=label.style_label_up,color=color.red,textcolor=color.white,size=size.small)
+            f_keep_label(sh)
+            if not na(activeLongPath)
+                f_keep_line(activeLongPath)
+                activeLongPath := na
+            bullStage := 0
+            longEntryTime := na
+            array.clear(longPathTimes)
+            array.clear(longPathPrices)
+            longPathTouches := 0
+        else
+            if longTP1Now
+                longTP1Touched := true
+                longTargetHitSignal := true
+                if executionDirection == "LONG"
+                    executionState := EXEC_TP1
+                longTradeStatus := enableTargetExtension and not na(longTP2Price) ? "TP1 HIT - AWAIT ACCEPTANCE" : "TP1 HIT"
+                lastTradeStatus := longTradeStatus
+                if showTargetHitLabels
+                    label th = label.new(t15,longTargetPrice,"LONG TP1 HIT\nCONSERVATIVE LIQUIDITY",xloc=xloc.bar_time,yloc=yloc.price,style=label.style_label_down,color=color.lime,textcolor=color.black,size=size.small)
+                    f_keep_label(th)
+                if not enableTargetExtension or na(longTP2Price)
+                    if executionDirection == "LONG"
+                        executionState := EXEC_CLOSED
+                        activeSequenceId := 0
+                    if not na(activeLongPath)
+                        f_keep_line(activeLongPath)
+                        activeLongPath := na
+                    bullStage := 0
+                    longEntryTime := na
+                    array.clear(longPathTimes)
+                    array.clear(longPathPrices)
+                    longPathTouches := 0
+            if (bullStage == 5 or (executionDirection == "LONG" and f_ticket_open())) and longAccept and enableTargetExtension and not na(longTP2Price) and not longRunnerActive
+                longRunnerActive := true
+                pathCLongSignal := enablePathC
+                if enablePathC
+                    lastTradePath := "C - TP1 CONTINUATION"
+                    executionPath := lastTradePath
+                    executionState := EXEC_RUNNER
+                    if showPathModelLabels
+                        label pc = label.new(t15,longTargetPrice,"PATH C LONG\nTP1 CONTINUATION",xloc=xloc.bar_time,style=label.style_label_down,color=color.aqua,textcolor=color.black,size=size.tiny)
+                        f_keep_label(pc)
+                longTradeStatus := "TP1 ACCEPTED - RUNNER ACTIVE"
+                lastTradeStatus := longTradeStatus
+                if showTargetHitLabels
+                    label ra = label.new(t15,longTargetPrice,"LONG RUNNER ACTIVE\nTP2: 1H BUY-SIDE LIQUIDITY",xloc=xloc.bar_time,yloc=yloc.price,style=label.style_label_down,color=color.aqua,textcolor=color.black,size=size.tiny)
+                    f_keep_label(ra)
+            if (bullStage == 5 or (executionDirection == "LONG" and f_ticket_open())) and longTP2Now
+                longTP2Touched := true
+                longTP2HitSignal := true
+                longTradeStatus := keepRunnerAfterTP2 ? "TP2 HIT - PATH RUNNER" : "TP2 HIT"
+                lastTradeStatus := longTradeStatus
+                if showTargetHitLabels
+                    label t2h = label.new(t15,longTP2Price,"LONG TP2 HIT\nEXTERNAL 1H LIQUIDITY",xloc=xloc.bar_time,yloc=yloc.price,style=label.style_label_down,color=color.aqua,textcolor=color.black,size=size.small)
+                    f_keep_label(t2h)
+                if not keepRunnerAfterTP2
+                    if executionDirection == "LONG"
+                        executionState := EXEC_CLOSED
+                        activeSequenceId := 0
+                    if not na(activeLongPath)
+                        f_keep_line(activeLongPath)
+                        activeLongPath := na
+                    bullStage := 0
+                    longEntryTime := na
+                    array.clear(longPathTimes)
+                    array.clear(longPathPrices)
+                    longPathTouches := 0
+
+    // Structural exits. Full-body mode uses the real body, not the wick.
+
+    if (bearStage == 5 or (executionDirection == "SHORT" and f_ticket_open())) and shortPathTouches >= pathMinimumTouches and not na(shortPathT1) and not na(shortPathT2)
+
+        float pathNow = f_line_value(shortPathT1,shortPathP1,shortPathT2,shortPathP2,t15)
+
+        bool failed = requireFullBodyExit ? (o15 > pathNow and c15 > pathNow) : c15 > pathNow
+
+        if failed and t15 > nz(shortEntryTime,0)
+
+            shortExitSignal := true
+            if executionDirection == "SHORT"
+                executionState := EXEC_CLOSED
+                activeSequenceId := 0
+            if enablePathB
+                bullFailedPathArmed := true
+                bullFailedPathAge := 0
+                bullFailedPathExtreme := l15
+            shortTradeStatus := "PATH EXIT"
+            lastTradeStatus := shortTradeStatus
+
+            if showPathExitLabels
+
+                label ex = label.new(t15,h15,"EXIT SHORT\nPATH FAILURE",xloc=xloc.bar_time,yloc=yloc.price,style=label.style_label_down,color=color.blue,textcolor=color.white,size=size.small)
+
+                f_keep_label(ex)
+
+            if not na(activeShortPath)
+
+                f_keep_line(activeShortPath)
+
+                activeShortPath := na
+
+            bearStage := 0
+
+            shortEntryTime := na
+
+            shortEntryPrice := na
+
+            array.clear(shortPathTimes)
+
+            array.clear(shortPathPrices)
+
+            shortPathTouches := 0
+
+    if (bullStage == 5 or (executionDirection == "LONG" and f_ticket_open())) and longPathTouches >= pathMinimumTouches and not na(longPathT1) and not na(longPathT2)
+
+        float pathNow = f_line_value(longPathT1,longPathP1,longPathT2,longPathP2,t15)
+
+        bool failed = requireFullBodyExit ? (o15 < pathNow and c15 < pathNow) : c15 < pathNow
+
+        if failed and t15 > nz(longEntryTime,0)
+
+            longExitSignal := true
+            if executionDirection == "LONG"
+                executionState := EXEC_CLOSED
+                activeSequenceId := 0
+            if enablePathB
+                bearFailedPathArmed := true
+                bearFailedPathAge := 0
+                bearFailedPathExtreme := h15
+            longTradeStatus := "PATH EXIT"
+            lastTradeStatus := longTradeStatus
+
+            if showPathExitLabels
+
+                label ex = label.new(t15,l15,"EXIT LONG\nPATH FAILURE",xloc=xloc.bar_time,yloc=yloc.price,style=label.style_label_up,color=color.blue,textcolor=color.white,size=size.small)
+
+                f_keep_label(ex)
+
+            if not na(activeLongPath)
+
+                f_keep_line(activeLongPath)
+
+                activeLongPath := na
+
+            bullStage := 0
+
+            longEntryTime := na
+
+            longEntryPrice := na
+
+            array.clear(longPathTimes)
+
+            array.clear(longPathPrices)
+
+            longPathTouches := 0
+
+    //=========================================================================
+    // V6.4 PATH B - FAILED-PATH REVERSAL
+    // A failed qualified trade arms the opposite direction. A fresh opposite
+    // displacement/BOS inside the confirmation window is required.
+    //=========================================================================
+    bool pathBLongDisp = bullFailedPathArmed and c15 > o15 and math.abs(c15-o15) >= atr15*minimumDispATR and c15 > localHigh15
+    if enablePathB and pathBLongDisp and f_entry_available() and f_gem_entry_allowed(1)
+        float e = c15
+        float s = bullFailedPathExtreme
+        float tp1 = f_target_above(swingHigh,oldSwingHigh,e,fallbackTargetHigh)
+        float tp2 = enableTargetExtension and not na(tp1) ? f_external_above(extHigh0,extHigh1,extHigh2,tp1) : na
+        bool geo = not enforceTradeGeometry or f_valid_long_geometry(e,s,tp1,tp2)
+        if geo
+            pathBLongSignal := true
+            sequenceCounter += 1
+            bullSequenceId := sequenceCounter
+            bullFailedPathArmed := false
+            bullStage := 5
+            longEntryTime := t15
+            longEntryPrice := e
+            longStopPrice := s
+            longTargetPrice := tp1
+            longTP2Price := tp2
+            longTP1Touched := false
+            longRunnerActive := false
+            longTP2Touched := false
+            longRiskPoints := e-s
+            longRewardPoints := tp1-e
+            longPlannedR := longRewardPoints/longRiskPoints
+            longTradeStatus := "LONG ACTIVE"
+            lastTradePath := "B - FAILED-PATH REVERSAL"
+            activeSequenceId := bullSequenceId
+            lastTradeSequenceId := bullSequenceId
+            executionDirection := "LONG"
+            executionPath := lastTradePath
+            executionState := EXEC_ACTIVE
+            lastGemClassCode := f_gem_class_code(1)
+            lastGemParentDir := gemParentDir
+            lastGemBridgeDir := gemBridgeDir
+            lastGemChild5Dir := gemChild5
+            lastGemChild1Dir := gemChild1
+            lastGemBridgeName := f_gem_bridge_name(1)
+            lastGemSnapshotTime := t15
+            lastGemNativeLsqAtEntry := -1
+            lastGemNativeSweepTimeAtEntry := na
+            lastGemNativeDispTimeAtEntry := t15
+            lastGemNativeIFVGAtEntry := false
+            lastGemNativeTouchesAtEntry := 0
+            lastGemNativeEvidenceOrigin := "FIX5_B_REVERSAL_ONLY_PREDECESSOR_UNVERIFIED"
+            lastTradeDirection := "LONG"
+            lastTradeEntry := e
+            lastTradeStop := s
+            lastTradeTarget := tp1
+            lastTradeTP2 := tp2
+            lastTradeRisk := longRiskPoints
+            lastTradeReward := longRewardPoints
+            lastTradeR := longPlannedR
+            lastTradeTP2R := not na(tp2) ? (tp2-e)/longRiskPoints : na
+            lastTradeStatus := longTradeStatus
+            array.clear(longPathTimes)
+            array.clear(longPathPrices)
+            if showPathModelLabels
+                label pb = label.new(t15,l15,"PATH B LONG" + (showSequenceOnLabels ? "\nSEQ #" + str.tostring(bullSequenceId) : "") + "\nFAILED-PATH REVERSAL",xloc=xloc.bar_time,style=label.style_label_up,color=color.lime,textcolor=color.black,size=size.small)
+                f_keep_label(pb)
+
+    bool pathBShortDisp = bearFailedPathArmed and c15 < o15 and math.abs(c15-o15) >= atr15*minimumDispATR and c15 < localLow15
+    if enablePathB and pathBShortDisp and f_entry_available() and f_gem_entry_allowed(-1)
+        float e = c15
+        float s = bearFailedPathExtreme
+        float tp1 = f_target_below(swingLow,oldSwingLow,e,fallbackTargetLow)
+        float tp2 = enableTargetExtension and not na(tp1) ? f_external_below(extLow0,extLow1,extLow2,tp1) : na
+        bool geo = not enforceTradeGeometry or f_valid_short_geometry(e,s,tp1,tp2)
+        if geo
+            pathBShortSignal := true
+            sequenceCounter += 1
+            bearSequenceId := sequenceCounter
+            bearFailedPathArmed := false
+            bearStage := 5
+            shortEntryTime := t15
+            shortEntryPrice := e
+            shortStopPrice := s
+            shortTargetPrice := tp1
+            shortTP2Price := tp2
+            shortTP1Touched := false
+            shortRunnerActive := false
+            shortTP2Touched := false
+            shortRiskPoints := s-e
+            shortRewardPoints := e-tp1
+            shortPlannedR := shortRewardPoints/shortRiskPoints
+            shortTradeStatus := "SHORT ACTIVE"
+            lastTradePath := "B - FAILED-PATH REVERSAL"
+            activeSequenceId := bearSequenceId
+            lastTradeSequenceId := bearSequenceId
+            executionDirection := "SHORT"
+            executionPath := lastTradePath
+            executionState := EXEC_ACTIVE
+            lastGemClassCode := f_gem_class_code(-1)
+            lastGemParentDir := gemParentDir
+            lastGemBridgeDir := gemBridgeDir
+            lastGemChild5Dir := gemChild5
+            lastGemChild1Dir := gemChild1
+            lastGemBridgeName := f_gem_bridge_name(-1)
+            lastGemSnapshotTime := t15
+            lastGemNativeLsqAtEntry := -1
+            lastGemNativeSweepTimeAtEntry := na
+            lastGemNativeDispTimeAtEntry := t15
+            lastGemNativeIFVGAtEntry := false
+            lastGemNativeTouchesAtEntry := 0
+            lastGemNativeEvidenceOrigin := "FIX5_B_REVERSAL_ONLY_PREDECESSOR_UNVERIFIED"
+            lastTradeDirection := "SHORT"
+            lastTradeEntry := e
+            lastTradeStop := s
+            lastTradeTarget := tp1
+            lastTradeTP2 := tp2
+            lastTradeRisk := shortRiskPoints
+            lastTradeReward := shortRewardPoints
+            lastTradeR := shortPlannedR
+            lastTradeTP2R := not na(tp2) ? (e-tp2)/shortRiskPoints : na
+            lastTradeStatus := shortTradeStatus
+            array.clear(shortPathTimes)
+            array.clear(shortPathPrices)
+            if showPathModelLabels
+                label pb = label.new(t15,h15,"PATH B SHORT" + (showSequenceOnLabels ? "\nSEQ #" + str.tostring(bearSequenceId) : "") + "\nFAILED-PATH REVERSAL",xloc=xloc.bar_time,style=label.style_label_down,color=color.red,textcolor=color.white,size=size.small)
+                f_keep_label(pb)
+
+    //=========================================================================
+    // V6.4 PATH D - COMPRESSION BREAK
+    // Uses only an already-qualified sweep + displacement + IFVG context.
+    // Compression must be tight relative to ATR, then price must expand in the
+    // model direction through the prior compression boundary.
+    //=========================================================================
+    float compHigh = ta.highest(h15[1], compressionBars)
+    float compLow = ta.lowest(l15[1], compressionBars)
+    bool compressed = not na(atr15) and (compHigh-compLow) <= atr15*compressionATR
+
+    bool pathDShortBreak = bearStage == 3 and bearIFVGReady and compressed and c15 < compLow-atr15*compressionBreakATR and c15 < o15
+    if enablePathD and pathDShortBreak and f_entry_available() and f_gem_entry_allowed(-1)
+        float e = c15
+        float s = bearSweepExtreme
+        float tp1 = f_target_below(swingLow,oldSwingLow,e,fallbackTargetLow)
+        float tp2 = enableTargetExtension and not na(tp1) ? f_external_below(extLow0,extLow1,extLow2,tp1) : na
+        bool geo = not enforceTradeGeometry or f_valid_short_geometry(e,s,tp1,tp2)
+        if geo
+            pathDShortSignal := true
+            bearStage := 5
+            shortEntryTime := t15
+            shortEntryPrice := e
+            shortStopPrice := s
+            shortTargetPrice := tp1
+            shortTP2Price := tp2
+            shortTP1Touched := false
+            shortRunnerActive := false
+            shortTP2Touched := false
+            shortRiskPoints := s-e
+            shortRewardPoints := e-tp1
+            shortPlannedR := shortRewardPoints/shortRiskPoints
+            shortTradeStatus := "SHORT ACTIVE"
+            lastTradePath := "D - COMPRESSION BREAK"
+            activeSequenceId := bearSequenceId
+            lastTradeSequenceId := bearSequenceId
+            executionDirection := "SHORT"
+            executionPath := lastTradePath
+            executionState := EXEC_ACTIVE
+            lastGemClassCode := f_gem_class_code(-1)
+            lastGemParentDir := gemParentDir
+            lastGemBridgeDir := gemBridgeDir
+            lastGemChild5Dir := gemChild5
+            lastGemChild1Dir := gemChild1
+            lastGemBridgeName := f_gem_bridge_name(-1)
+            lastGemSnapshotTime := t15
+            lastGemNativeLsqAtEntry := bearModelLSQ
+            lastGemNativeSweepTimeAtEntry := bearSweepTime
+            lastGemNativeDispTimeAtEntry := bearDispTime
+            lastGemNativeIFVGAtEntry := bearIFVGReady
+            lastGemNativeTouchesAtEntry := bearTouches
+            lastGemNativeEvidenceOrigin := "FIX5_D_NATIVE_ONLY"
+            lastTradeDirection := "SHORT"
+            lastTradeEntry := e
+            lastTradeStop := s
+            lastTradeTarget := tp1
+            lastTradeTP2 := tp2
+            lastTradeRisk := shortRiskPoints
+            lastTradeReward := shortRewardPoints
+            lastTradeR := shortPlannedR
+            lastTradeTP2R := not na(tp2) ? (e-tp2)/shortRiskPoints : na
+            lastTradeLSQ := bearModelLSQ
+            lastTradeStatus := shortTradeStatus
+            array.clear(shortPathTimes)
+            array.clear(shortPathPrices)
+            if showPathModelLabels
+                label pd = label.new(t15,h15,"PATH D SHORT" + (showSequenceOnLabels ? "\nSEQ #" + str.tostring(bearSequenceId) : "") + "\nCOMPRESSION BREAK",xloc=xloc.bar_time,style=label.style_label_down,color=color.red,textcolor=color.white,size=size.small)
+                f_keep_label(pd)
+
+    bool pathDLongBreak = bullStage == 3 and bullIFVGReady and compressed and c15 > compHigh+atr15*compressionBreakATR and c15 > o15
+    if enablePathD and pathDLongBreak and f_entry_available() and f_gem_entry_allowed(1)
+        float e = c15
+        float s = bullSweepExtreme
+        float tp1 = f_target_above(swingHigh,oldSwingHigh,e,fallbackTargetHigh)
+        float tp2 = enableTargetExtension and not na(tp1) ? f_external_above(extHigh0,extHigh1,extHigh2,tp1) : na
+        bool geo = not enforceTradeGeometry or f_valid_long_geometry(e,s,tp1,tp2)
+        if geo
+            pathDLongSignal := true
+            bullStage := 5
+            longEntryTime := t15
+            longEntryPrice := e
+            longStopPrice := s
+            longTargetPrice := tp1
+            longTP2Price := tp2
+            longTP1Touched := false
+            longRunnerActive := false
+            longTP2Touched := false
+            longRiskPoints := e-s
+            longRewardPoints := tp1-e
+            longPlannedR := longRewardPoints/longRiskPoints
+            longTradeStatus := "LONG ACTIVE"
+            lastTradePath := "D - COMPRESSION BREAK"
+            activeSequenceId := bullSequenceId
+            lastTradeSequenceId := bullSequenceId
+            executionDirection := "LONG"
+            executionPath := lastTradePath
+            executionState := EXEC_ACTIVE
+            lastGemClassCode := f_gem_class_code(1)
+            lastGemParentDir := gemParentDir
+            lastGemBridgeDir := gemBridgeDir
+            lastGemChild5Dir := gemChild5
+            lastGemChild1Dir := gemChild1
+            lastGemBridgeName := f_gem_bridge_name(1)
+            lastGemSnapshotTime := t15
+            lastGemNativeLsqAtEntry := bullModelLSQ
+            lastGemNativeSweepTimeAtEntry := bullSweepTime
+            lastGemNativeDispTimeAtEntry := bullDispTime
+            lastGemNativeIFVGAtEntry := bullIFVGReady
+            lastGemNativeTouchesAtEntry := bullTouches
+            lastGemNativeEvidenceOrigin := "FIX5_D_NATIVE_ONLY"
+            lastTradeDirection := "LONG"
+            lastTradeEntry := e
+            lastTradeStop := s
+            lastTradeTarget := tp1
+            lastTradeTP2 := tp2
+            lastTradeRisk := longRiskPoints
+            lastTradeReward := longRewardPoints
+            lastTradeR := longPlannedR
+            lastTradeTP2R := not na(tp2) ? (tp2-e)/longRiskPoints : na
+            lastTradeLSQ := bullModelLSQ
+            lastTradeStatus := longTradeStatus
+            array.clear(longPathTimes)
+            array.clear(longPathPrices)
+            if showPathModelLabels
+                label pd = label.new(t15,l15,"PATH D LONG" + (showSequenceOnLabels ? "\nSEQ #" + str.tostring(bullSequenceId) : "") + "\nCOMPRESSION BREAK",xloc=xloc.bar_time,style=label.style_label_up,color=color.lime,textcolor=color.black,size=size.small)
+                f_keep_label(pd)
+
+    if resetOnOppositeFinal
+
+        if bearFinalSignal and bullStage>0 and bullStage<5
+
+            bullStage:=0
+
+        if bullFinalSignal and bearStage>0 and bearStage<5
+
+            bearStage:=0
+
+//=============================================================================
+
+// ALERTS
+
+//=============================================================================
+
+alertcondition(enableSweepAlerts and bearSweepEvent, title="Buy-Side Liquidity Sweep - LSQ", message="Buy-side liquidity sweep qualified by LSQ.")
+
+alertcondition(enableSweepAlerts and bullSweepEvent, title="Sell-Side Liquidity Sweep - LSQ", message="Sell-side liquidity sweep qualified by LSQ.")
+
+alertcondition(enableFinalAlerts and bearFinalSignal, title="SHORT Entry Confirmed", message="SHORT ENTRY: Buy-side sweep + LSQ + bearish displacement/BOS + IFVG + setup-line break.")
+
+alertcondition(enableFinalAlerts and bullFinalSignal, title="LONG Entry Confirmed", message="LONG ENTRY: Sell-side sweep + LSQ + bullish displacement/BOS + IFVG + setup-line break.")
+alertcondition(enableFinalAlerts and pathBShortSignal, title="V6.4 Path B SHORT", message="PATH B SHORT: failed bullish path + bearish displacement/BOS + valid geometry.")
+alertcondition(enableFinalAlerts and pathBLongSignal, title="V6.4 Path B LONG", message="PATH B LONG: failed bearish path + bullish displacement/BOS + valid geometry.")
+alertcondition(enableFinalAlerts and pathCShortSignal, title="V6.4 Path C SHORT Continuation", message="PATH C SHORT: TP1 accepted; external-liquidity runner active.")
+alertcondition(enableFinalAlerts and pathCLongSignal, title="V6.4 Path C LONG Continuation", message="PATH C LONG: TP1 accepted; external-liquidity runner active.")
+alertcondition(enableFinalAlerts and pathDShortSignal, title="V6.4 Path D SHORT", message="PATH D SHORT: qualified bearish IFVG context + compression + downside expansion.")
+alertcondition(enableFinalAlerts and pathDLongSignal, title="V6.4 Path D LONG", message="PATH D LONG: qualified bullish IFVG context + compression + upside expansion.")
+
+alertcondition(enableFinalAlerts and shortExitSignal, title="EXIT SHORT - Path Failure", message="EXIT SHORT: full-body failure above active falling directional path.")
+
+alertcondition(enableFinalAlerts and longExitSignal, title="EXIT LONG - Path Failure", message="EXIT LONG: full-body failure below active rising directional path.")
+alertcondition(enableFinalAlerts and shortTargetHitSignal, title="SHORT TP1 - Conservative Liquidity", message="SHORT TP1 HIT: conservative opposing sell-side liquidity reached.")
+alertcondition(enableFinalAlerts and longTargetHitSignal, title="LONG TP1 - Conservative Liquidity", message="LONG TP1 HIT: conservative opposing buy-side liquidity reached.")
+alertcondition(enableFinalAlerts and shortTP2HitSignal, title="SHORT TP2 - External 1H Liquidity", message="SHORT TP2 HIT: external 1H sell-side liquidity reached.")
+alertcondition(enableFinalAlerts and longTP2HitSignal, title="LONG TP2 - External 1H Liquidity", message="LONG TP2 HIT: external 1H buy-side liquidity reached.")
+alertcondition(enableFinalAlerts and shortStopHitSignal, title="SHORT Stop - Sweep Invalidation", message="SHORT STOP HIT: price traded back through the originating buy-side sweep extreme.")
+alertcondition(enableFinalAlerts and longStopHitSignal, title="LONG Stop - Sweep Invalidation", message="LONG STOP HIT: price traded back through the originating sell-side sweep extreme.")
+
+string eventName = pathBShortSignal ? "path_b_short_failed_path_reversal" : pathBLongSignal ? "path_b_long_failed_path_reversal" : pathCShortSignal ? "path_c_short_tp1_continuation" : pathCLongSignal ? "path_c_long_tp1_continuation" : pathDShortSignal ? "path_d_short_compression_break" : pathDLongSignal ? "path_d_long_compression_break" : shortTP2HitSignal ? "short_tp2_external_1h_liquidity" : longTP2HitSignal ? "long_tp2_external_1h_liquidity" : shortTargetHitSignal ? "short_tp1_conservative_liquidity" : longTargetHitSignal ? "long_tp1_conservative_liquidity" : shortStopHitSignal ? "short_stop_sweep_invalidation" : longStopHitSignal ? "long_stop_sweep_invalidation" : shortExitSignal ? "exit_short_path_failure" : longExitSignal ? "exit_long_path_failure" : bearFinalSignal ? "short_entry_confirmed" : bullFinalSignal ? "long_entry_confirmed" : bearSweepEvent ? "buy_side_sweep_lsq" : bullSweepEvent ? "sell_side_sweep_lsq" : ""
+
+bool hasWebhookEvent = eventName != ""
+
+string direction = pathBShortSignal or pathCShortSignal or pathDShortSignal or bearFinalSignal or bearSweepEvent or shortExitSignal or shortTargetHitSignal or shortTP2HitSignal or shortStopHitSignal ? "short" : pathBLongSignal or pathCLongSignal or pathDLongSignal or bullFinalSignal or bullSweepEvent or longExitSignal or longTargetHitSignal or longTP2HitSignal or longStopHitSignal ? "long" : "none"
+
+// Sweep events use their fresh qualifier; entry/TP/exit events use the
+// LSQ attached to the current/last ticket. Path B inherits the qualifier
+// from the FAILED predecessor; it does NOT claim a newly qualified sweep.
+int eventLSQ = eventName == "buy_side_sweep_lsq" ? bearishLSQ : eventName == "sell_side_sweep_lsq" ? bullishLSQ : lastTradeLSQ
+string eventLsqOrigin = eventName == "buy_side_sweep_lsq" or eventName == "sell_side_sweep_lsq" ? "SWEEP" : pathBShortSignal or pathBLongSignal ? "FAILED_PATH_INHERITED" : pathCShortSignal or pathCLongSignal ? "ENTRY_CONTINUATION" : pathDShortSignal or pathDLongSignal ? "PATH_D_SWEEP" : "TICKET_OR_EXIT"
+bool eventSweepEvidenceOnly = (eventName == "buy_side_sweep_lsq" and bearSweepEvidenceOnly) or (eventName == "sell_side_sweep_lsq" and bullSweepEvidenceOnly)
+
+int eventStage = direction=="short" ? bearStage : direction=="long" ? bullStage : 0
+
+float eventSweepLevel = eventName == "buy_side_sweep_lsq" ? swingHigh : eventName == "sell_side_sweep_lsq" ? swingLow : direction=="short" ? bearSweepLevel : direction=="long" ? bullSweepLevel : na
+
+float eventExitLevel = bearFinalSignal ? lastBearExitLevel : bullFinalSignal ? lastBullExitLevel : na
+
+int eventTouches = direction=="short" ? bearTouches : direction=="long" ? bullTouches : 0
+
+bool eventIFVG = direction=="short" ? bearIFVGReady : direction=="long" ? bullIFVGReady : false
+
+string payload = '{"secret":"' + webhookSecret +
+
+ '","event":"' + eventName +
+
+ '","symbol":"' + syminfo.ticker +
+
+ '","tickerid":"' + syminfo.tickerid +
+
+ '","chart_timeframe":"' + timeframe.period +
+
+ '","anchor_timeframe":"' + anchorTF +
+
+ '","direction":"' + direction +
+
+ '","lsq":' + str.tostring(eventLSQ) +
+
+ ',"lsq_origin":"' + eventLsqOrigin + '"' +
+ ',"sweep_evidence_only":' + str.tostring(eventSweepEvidenceOnly) +
+ ',"stage":' + str.tostring(eventStage) +
+ ' ,"sequence_id":' + str.tostring(lastTradeSequenceId) +
+ ' ,"model_path":"' + executionPath + '"' +
+ ' ,"execution_state":"' + f_exec_state_name(executionState) + '"' +
+ ' ,"gem_parent_authority":"' + f_gem_dir_name(lastGemParentDir) + '"' +
+ ' ,"gem_bridge":"' + lastGemBridgeName + '"' +
+ ' ,"gem_child_5m":"' + f_gem_dir_name(lastGemChild5Dir) + '"' +
+ ' ,"gem_child_1m":"' + f_gem_dir_name(lastGemChild1Dir) + '"' +
+ ' ,"gem_class":"' + f_gem_class_name(lastGemClassCode) + '"' +
+ ' ,"gem_privilege_candidate":"' + f_gem_privilege_name(lastGemClassCode) + '"' +
+ ' ,"gem_certified":false' +
+ ' ,"gem_snapshot_time":' + str.tostring(nz(lastGemSnapshotTime, 0)) +
+ ' ,"gem_evidence_origin":"' + lastGemNativeEvidenceOrigin + '"' +
+ ' ,"gem_playbook_mapping":"UNMAPPED"' +
+ ' ,"gem_native_lsq_at_entry":' + str.tostring(lastGemNativeLsqAtEntry) +
+ ' ,"gem_native_sweep_time":' + str.tostring(nz(lastGemNativeSweepTimeAtEntry, 0)) +
+ ' ,"gem_native_displacement_time":' + str.tostring(nz(lastGemNativeDispTimeAtEntry, 0)) +
+ ' ,"gem_native_ifvg_at_entry":' + str.tostring(lastGemNativeIFVGAtEntry) +
+ ' ,"gem_native_touches_at_entry":' + str.tostring(lastGemNativeTouchesAtEntry) +
+
+ ',"price":"' + str.tostring(close,format.mintick) +
+
+ '","sweep_level":"' + str.tostring(eventSweepLevel,format.mintick) +
+
+ '","ifvg_ready":' + str.tostring(eventIFVG) +
+
+ ',"trendline_touches":' + str.tostring(eventTouches) +
+
+ ',"exit_key_level":"' + str.tostring(eventExitLevel,format.mintick) +
+
+ '","time":' + str.tostring(time) + '}'
+
+if enableWebhook and hasWebhookEvent and barstate.isconfirmed
+
+    alert(payload, alert.freq_once_per_bar_close)
+
+
+//=============================================================================
+// BOTTOM-LEFT TRADE TICKET - latest confirmed model
+//=============================================================================
+var table tradeTicket = table.new(position.bottom_left, 2, 20, border_width=1)
+
+if barstate.islast
+    if showTradeTicket
+        color dirColor = lastTradeDirection == "LONG" ? color.lime : lastTradeDirection == "SHORT" ? color.red : color.silver
+        table.cell(tradeTicket,0,0,"TRADE TICKET - " + lastTradeDirection + " SETUP",text_color=dirColor,bgcolor=color.new(color.black,0),text_size=size.small)
+        table.cell(tradeTicket,1,0,lastTradeStatus,text_color=dirColor,bgcolor=color.new(color.black,0),text_size=size.small)
+        table.cell(tradeTicket,0,1,"DIRECTION",text_color=color.white,bgcolor=color.black)
+        table.cell(tradeTicket,1,1,lastTradeDirection,text_color=dirColor,bgcolor=color.black)
+        table.cell(tradeTicket,0,2,"ENTRY",text_color=color.white,bgcolor=color.black)
+        table.cell(tradeTicket,1,2,str.tostring(lastTradeEntry,format.mintick),text_color=color.white,bgcolor=color.black)
+        table.cell(tradeTicket,0,3,"STOP / INVALIDATION",text_color=color.white,bgcolor=color.black)
+        table.cell(tradeTicket,1,3,str.tostring(lastTradeStop,format.mintick),text_color=color.red,bgcolor=color.black)
+        table.cell(tradeTicket,0,4,"TP1 CONSERVATIVE LIQ.",text_color=color.white,bgcolor=color.black)
+        table.cell(tradeTicket,1,4,str.tostring(lastTradeTarget,format.mintick),text_color=color.lime,bgcolor=color.black)
+        table.cell(tradeTicket,0,5,"TP2 EXTERNAL " + extensionTF,text_color=color.white,bgcolor=color.black)
+        table.cell(tradeTicket,1,5,na(lastTradeTP2) ? "n/a" : str.tostring(lastTradeTP2,format.mintick),text_color=color.aqua,bgcolor=color.black)
+        table.cell(tradeTicket,0,6,"RISK (POINTS)",text_color=color.white,bgcolor=color.black)
+        table.cell(tradeTicket,1,6,str.tostring(lastTradeRisk,"#.##"),text_color=color.red,bgcolor=color.black)
+        table.cell(tradeTicket,0,7,"TP1 REWARD",text_color=color.white,bgcolor=color.black)
+        table.cell(tradeTicket,1,7,str.tostring(lastTradeReward,"#.##"),text_color=color.lime,bgcolor=color.black)
+        table.cell(tradeTicket,0,8,"TP1 / TP2 R:R",text_color=color.white,bgcolor=color.black)
+        string rrText = (na(lastTradeR) ? "n/a" : "1:" + str.tostring(lastTradeR,"#.##")) + " / " + (na(lastTradeTP2R) ? "n/a" : "1:" + str.tostring(lastTradeTP2R,"#.##"))
+        table.cell(tradeTicket,1,8,rrText,text_color=color.yellow,bgcolor=color.black)
+        table.cell(tradeTicket,0,9,"TARGET MODE",text_color=color.white,bgcolor=color.black)
+        table.cell(tradeTicket,1,9,enableTargetExtension ? "TP1 -> ACCEPT -> TP2" : "TP1 ONLY",text_color=color.aqua,bgcolor=color.black)
+        table.cell(tradeTicket,0,10,"MODEL PATH",text_color=color.white,bgcolor=color.black)
+        table.cell(tradeTicket,1,10,lastTradePath,text_color=color.aqua,bgcolor=color.black)
+        table.cell(tradeTicket,0,11,"SEQUENCE ID",text_color=color.white,bgcolor=color.black)
+        table.cell(tradeTicket,1,11,lastTradeSequenceId > 0 ? "#" + str.tostring(lastTradeSequenceId) : "n/a",text_color=color.yellow,bgcolor=color.black)
+        table.cell(tradeTicket,0,12,"EXECUTION STATE",text_color=color.white,bgcolor=color.black)
+        table.cell(tradeTicket,1,12,f_exec_state_name(executionState),text_color=dirColor,bgcolor=color.black)
+        table.cell(tradeTicket,0,13,"EXECUTION PATH",text_color=color.white,bgcolor=color.black)
+        table.cell(tradeTicket,1,13,executionPath,text_color=color.aqua,bgcolor=color.black)
+        table.cell(tradeTicket,0,14,"LSQ / MODEL",text_color=color.white,bgcolor=color.black)
+        table.cell(tradeTicket,1,14,str.tostring(lastTradeLSQ)+"/100 | V6.4 FIX5 TEST",text_color=color.yellow,bgcolor=color.black)
+        if gemShowTicketRows
+            table.cell(tradeTicket,0,15,"PARENT (ENTRY)",text_color=color.white,bgcolor=color.black)
+            table.cell(tradeTicket,1,15,f_gem_dir_name(lastGemParentDir),text_color=color.orange,bgcolor=color.black)
+            table.cell(tradeTicket,0,16,"15M BRIDGE (ENTRY)",text_color=color.white,bgcolor=color.black)
+            table.cell(tradeTicket,1,16,lastGemBridgeName,text_color=color.orange,bgcolor=color.black)
+            table.cell(tradeTicket,0,17,"CHILD 5M / 1M",text_color=color.white,bgcolor=color.black)
+            table.cell(tradeTicket,1,17,f_gem_dir_name(lastGemChild5Dir)+" / "+f_gem_dir_name(lastGemChild1Dir),text_color=color.aqua,bgcolor=color.black)
+            table.cell(tradeTicket,0,18,"GEM CLASS (ENTRY)",text_color=color.white,bgcolor=color.black)
+            table.cell(tradeTicket,1,18,f_gem_class_name(lastGemClassCode),text_color=color.yellow,bgcolor=color.black)
+            table.cell(tradeTicket,0,19,"PRIVILEGE (PENDING)",text_color=color.white,bgcolor=color.black)
+            table.cell(tradeTicket,1,19,f_gem_privilege_name(lastGemClassCode),text_color=color.yellow,bgcolor=color.black)
+        else
+            table.clear(tradeTicket,0,15,1,19)
+    else
+        table.clear(tradeTicket,0,0,1,19)
+
+// Debug state values available in Data Window.
+
+plot(debugMode ? bearStage : na, "Bear Model Stage", color=color.red, display=display.data_window)
+
+plot(debugMode ? bullStage : na, "Bull Model Stage", color=color.green, display=display.data_window)
+
+plot(debugMode ? bearModelLSQ : na, "Bear Model LSQ", color=color.red, display=display.data_window)
+
+plot(debugMode ? bullModelLSQ : na, "Bull Model LSQ", color=color.green, display=display.data_window)
+
+plot(debugMode ? shortPathTouches : na, "Short Path Touches", color=color.red, display=display.data_window)
+
+plot(debugMode ? longPathTouches : na, "Long Path Touches", color=color.green, display=display.data_window)
+// FIX5 replay diagnostics. Read these in the Data Window when Debug model stages is enabled.
+plot(debugMode ? executionState : na, "Ticket Execution State Code", color=color.orange, display=display.data_window)
+plot(debugMode ? activeSequenceId : na, "Active Ticket Sequence ID", color=color.aqua, display=display.data_window)
+plot(debugMode ? (bearSweepEvidenceOnly or bullSweepEvidenceOnly ? 1 : 0) : na, "Sweep Observation Only", color=color.yellow, display=display.data_window)
+
+// GEM research Data Window: last-ticket fields do NOT update after entry.
+plot(debugMode ? gemParentDir : na, "GEM Parent 1H Direction (+1/-1/0)", color=color.orange, display=display.data_window)
+plot(debugMode ? gemBridgeDir : na, "GEM Bridge 15m Direction (+1/-1/0)", color=color.yellow, display=display.data_window)
+plot(debugMode ? gemChild5 : na, "GEM Child 5m Direction (+1/-1/0)", color=color.teal, display=display.data_window)
+plot(debugMode ? gemChild1 : na, "GEM Child 1m Direction (+1/-1/0)", color=color.aqua, display=display.data_window)
+plot(debugMode ? lastGemClassCode : na, "GEM Ticket Class Code (0 pending, 1 aligned, 2 tactical)", color=color.orange, display=display.data_window)
+plot(debugMode ? lastGemSnapshotTime : na, "GEM Ticket Snapshot Time", color=color.silver, display=display.data_window)
+plot(debugMode ? (gemChartAligned ? 1 : 0) : na, "GEM Chart Matches Anchor", color=color.lime, display=display.data_window)
+// Native FIX5 evidence is frozen at ticket birth; does not assert other indicators fired.
+plot(debugMode ? lastGemNativeLsqAtEntry : na, "FIX5.1 Entry Native LSQ (-1 unverified)", color=color.yellow, display=display.data_window)
+plot(debugMode ? (lastGemNativeIFVGAtEntry ? 1 : 0) : na, "FIX5.1 Entry Native IFVG Flag", color=color.orange, display=display.data_window)
+plot(debugMode ? lastGemNativeTouchesAtEntry : na, "FIX5.1 Entry Native Path Touches", color=color.teal, display=display.data_window)
+plot(debugMode ? lastGemNativeSweepTimeAtEntry : na, "FIX5.1 Entry Native Sweep Time", color=color.silver, display=display.data_window)
+plot(debugMode ? lastGemNativeDispTimeAtEntry : na, "FIX5.1 Entry Native Displacement Time", color=color.aqua, display=display.data_window)
+
