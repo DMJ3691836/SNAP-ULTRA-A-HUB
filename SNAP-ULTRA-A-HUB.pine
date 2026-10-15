@@ -1,0 +1,579 @@
+// This source code is subject to the terms of the Apache License 2.0
+// © DMJ3691836
+
+//@version=5
+// =============================================================================
+// SNAP ULTRA A+ HUB
+// Rule-based market-state classification and confluence engine
+//
+// Responsibilities:
+//   1. Observation   – sessions, range, structure, liquidity, momentum,
+//                      volume, volatility
+//   2. Interpretation – raid, displacement, MSS, premium/discount, FVG,
+//                       VWAP & EMA alignment
+//   3. Qualification  – 10-point confluence score; A (≥7) and A+ (≥9) grades
+//   4. Communication  – labels, zones, reference lines, dashboard, alerts
+// =============================================================================
+indicator("SNAP ULTRA A+ HUB", shorttitle = "SNAP A+ HUB", overlay = true,
+         max_bars_back    = 500,
+         max_lines_count  = 200,
+         max_boxes_count  = 200,
+         max_labels_count = 200)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+// ── Structure ────────────────────────────────────────────────────────────────
+var G_STRUCT     = "Structure"
+i_swing_len      = input.int(10,  "Swing Length",
+                   minval = 3, maxval = 50, group = G_STRUCT,
+                   tooltip = "Number of bars on each side used to detect a swing pivot.")
+
+// ── Liquidity ────────────────────────────────────────────────────────────────
+var G_LIQ        = "Liquidity"
+i_eq_tol         = input.float(0.0002, "Equal-Level Tolerance (%)",
+                   minval = 0.0001, maxval = 0.005, step = 0.0001, group = G_LIQ,
+                   tooltip = "Maximum price distance (as a fraction) between two swing levels for them to be treated as equal (liquidity-building).")
+i_liq_lb         = input.int(50, "Range Look-back (bars)",
+                   minval = 20, maxval = 500, group = G_LIQ,
+                   tooltip = "Number of bars used to calculate the rolling session high/low range.")
+
+// ── Momentum & Value ─────────────────────────────────────────────────────────
+var G_MOM        = "Momentum & Value"
+i_ema_fast       = input.int(20, "Fast EMA",
+                   minval = 5,  maxval = 100, group = G_MOM)
+i_ema_slow       = input.int(50, "Slow EMA",
+                   minval = 10, maxval = 300, group = G_MOM)
+i_use_vwap       = input.bool(true, "Use VWAP",  group = G_MOM,
+                   tooltip = "Include VWAP in scoring and display.")
+
+// ── Displacement ─────────────────────────────────────────────────────────────
+var G_DISP_CFG   = "Displacement"
+i_disp_mult      = input.float(1.5, "Displacement ATR Multiplier",
+                   minval = 0.5, maxval = 5.0, step = 0.1, group = G_DISP_CFG,
+                   tooltip = "A candle body must be ≥ this multiple of the 14-period ATR to qualify as displacement.")
+
+// ── Scoring ──────────────────────────────────────────────────────────────────
+var G_SCORE      = "Scoring"
+i_a_thresh       = input.int(7, "A  Score Threshold  (max 10)",
+                   minval = 4, maxval = 9,  group = G_SCORE)
+i_ap_thresh      = input.int(9, "A+ Score Threshold  (max 10)",
+                   minval = 5, maxval = 10, group = G_SCORE)
+
+// ── Display ──────────────────────────────────────────────────────────────────
+var G_DISP       = "Display"
+i_show_fvg       = input.bool(true,  "Show Fair Value Gaps",           group = G_DISP)
+i_show_liq       = input.bool(true,  "Show Liquidity Level Lines",     group = G_DISP)
+i_show_struct    = input.bool(true,  "Show Structure Labels",          group = G_DISP)
+i_show_dash      = input.bool(true,  "Show Dashboard",                 group = G_DISP)
+i_show_zones     = input.bool(true,  "Show Premium / Discount Zones",  group = G_DISP)
+i_show_grade_lbl = input.bool(true,  "Show A / A+ Grade Labels",       group = G_DISP)
+
+// =============================================================================
+// COLOURS
+// =============================================================================
+C_BULL    = color.new(color.teal,   0)
+C_BEAR    = color.new(color.red,    0)
+C_NEUT    = color.new(color.gray,   0)
+C_PREM    = color.new(color.red,    82)
+C_DISC    = color.new(color.teal,   82)
+C_FVG_B   = color.new(color.teal,   80)
+C_FVG_S   = color.new(color.red,    80)
+C_LIQ     = color.new(color.orange, 0)
+C_A       = color.new(color.yellow, 0)
+C_APLUS   = color.new(color.lime,   0)
+
+// =============================================================================
+// USER-DEFINED FUNCTIONS
+// =============================================================================
+
+// Tick mark / dash for dashboard cells
+f_tick(cond) => cond ? "✓" : "–"
+
+// Background colour for dashboard cells
+f_bg(cond) => cond ? color.new(color.teal, 40) : color.new(color.gray, 70)
+
+// =============================================================================
+// SECTION 1 – OBSERVATION
+// =============================================================================
+
+// ── Volatility ───────────────────────────────────────────────────────────────
+atr_val   = ta.atr(14)
+
+// ── EMAs  ────────────────────────────────────────────────────────────────────
+ema_f     = ta.ema(close, i_ema_fast)
+ema_s     = ta.ema(close, i_ema_slow)
+
+// ── VWAP  ────────────────────────────────────────────────────────────────────
+vwap_val  = ta.vwap
+
+// ── Volume ───────────────────────────────────────────────────────────────────
+vol_ma    = ta.sma(volume, 20)
+high_vol  = volume > vol_ma * 1.5
+
+// ── Swing Structure ──────────────────────────────────────────────────────────
+// ta.pivothigh / pivotlow return the pivot value swing_len bars AFTER the pivot;
+// the actual pivot bar is at bar_index - i_swing_len.
+swing_h   = ta.pivothigh(high, i_swing_len, i_swing_len)
+swing_l   = ta.pivotlow (low,  i_swing_len, i_swing_len)
+
+// Track the two most-recent swing highs and lows
+var float prev_sh     = na
+var float last_sh     = na
+var int   last_sh_bar = na
+
+var float prev_sl     = na
+var float last_sl     = na
+var int   last_sl_bar = na
+
+if not na(swing_h)
+    prev_sh     := last_sh
+    last_sh     := swing_h
+    last_sh_bar := bar_index - i_swing_len
+
+if not na(swing_l)
+    prev_sl     := last_sl
+    last_sl     := swing_l
+    last_sl_bar := bar_index - i_swing_len
+
+// ── Rolling Range (session-proxy) ────────────────────────────────────────────
+range_hi  = ta.highest(high, i_liq_lb)
+range_lo  = ta.lowest (low,  i_liq_lb)
+range_mid = math.avg(range_hi, range_lo)
+
+// =============================================================================
+// SECTION 2 – INTERPRETATION
+// =============================================================================
+
+// ── 2.1  Trend / EMA Flow ────────────────────────────────────────────────────
+bull_trend    = ema_f > ema_s and close > ema_s
+bear_trend    = ema_f < ema_s and close < ema_s
+ema_flow_bull = ema_f > ema_s and ema_f > ema_f[1]  // expanding bullish flow
+ema_flow_bear = ema_f < ema_s and ema_f < ema_f[1]  // expanding bearish flow
+
+// ── 2.2  Market Structure  ────────────────────────────────────────────────────
+// HH / HL = bullish structure sequence
+// LH / LL = bearish structure sequence
+hh = not na(swing_h) and not na(prev_sh) and swing_h > prev_sh  // higher high
+lh = not na(swing_h) and not na(prev_sh) and swing_h < prev_sh  // lower  high
+hl = not na(swing_l) and not na(prev_sl) and swing_l > prev_sl  // higher low
+ll = not na(swing_l) and not na(prev_sl) and swing_l < prev_sl  // lower  low
+
+// ── 2.3  Market Structure Shift (MSS) ────────────────────────────────────────
+// Bullish MSS: close crosses above the last swing high  (liquidity taken → shift)
+// Bearish MSS: close crosses below the last swing low
+mss_bull = not na(last_sh) and ta.crossover (close, last_sh)
+mss_bear = not na(last_sl) and ta.crossunder(close, last_sl)
+
+// ── 2.4  Premium / Discount ──────────────────────────────────────────────────
+// Premium = upper half of the rolling range  → look for shorts
+// Discount = lower half                       → look for longs
+in_premium  = close > range_mid
+in_discount = close < range_mid
+
+// ── 2.5  Liquidity  ──────────────────────────────────────────────────────────
+// Equal highs = buy-side liquidity (BSL) building above
+eq_high = not na(swing_h) and not na(last_sh) and
+          math.abs(swing_h - last_sh) / last_sh <= i_eq_tol
+
+// Equal lows = sell-side liquidity (SSL) building below
+eq_low  = not na(swing_l) and not na(last_sl) and
+          math.abs(swing_l - last_sl) / last_sl <= i_eq_tol
+
+// Market state: building liquidity
+building_liq = eq_high or eq_low
+
+// ── 2.6  Liquidity Raids ─────────────────────────────────────────────────────
+// Bullish raid: wick sweeps below last swing low (SSL), close recovers above
+raid_bull = not na(last_sl) and low < last_sl and close > last_sl
+
+// Bearish raid: wick sweeps above last swing high (BSL), close drops below
+raid_bear = not na(last_sh) and high > last_sh and close < last_sh
+
+// ── 2.7  Displacement ────────────────────────────────────────────────────────
+// Large-bodied candle (≥ ATR multiplier) with above-average volume
+body          = math.abs(close - open)
+disp_bull     = close > open and body >= atr_val * i_disp_mult and volume > vol_ma
+disp_bear     = close < open and body >= atr_val * i_disp_mult and volume > vol_ma
+
+// ── 2.8  Fair Value Gap (FVG / Imbalance) ────────────────────────────────────
+// Bullish FVG: high[2] < low[0]  (gap between bars 0 and 2, bullish middle bar)
+// Bearish FVG: low[2] > high[0]  (gap between bars 2 and 0, bearish middle bar)
+fvg_bull = high[2] < low[0]  and close[1] > open[1]
+fvg_bear = low[2]  > high[0] and close[1] < open[1]
+
+// Track most-recent FVG boundaries for "retracing into imbalance" detection
+var float fvg_b_top = na
+var float fvg_b_bot = na
+var float fvg_s_top = na
+var float fvg_s_bot = na
+
+if fvg_bull
+    fvg_b_top := low[0]   // top of bullish FVG  = current low
+    fvg_b_bot := high[2]  // bot of bullish FVG  = high 2 bars ago
+
+if fvg_bear
+    fvg_s_top := low[2]   // top of bearish FVG  = low 2 bars ago
+    fvg_s_bot := high[0]  // bot of bearish FVG  = current high
+
+// Price retracing into (or still inside) the most-recent FVG
+in_bull_fvg = not na(fvg_b_top) and close >= fvg_b_bot and close <= fvg_b_top
+in_bear_fvg = not na(fvg_s_top) and close >= fvg_s_bot and close <= fvg_s_top
+
+// ── 2.9  VWAP Alignment ──────────────────────────────────────────────────────
+// Bullish: price is above VWAP (trading at or above fair value)
+// Bearish: price is below VWAP
+vwap_align_bull = i_use_vwap and close > vwap_val
+vwap_align_bear = i_use_vwap and close < vwap_val
+vwap_cross_bull = i_use_vwap and ta.crossover (close, vwap_val)  // alert trigger
+vwap_cross_bear = i_use_vwap and ta.crossunder(close, vwap_val)  // alert trigger
+
+// =============================================================================
+// SECTION 3 – QUALIFICATION (SCORING)
+// =============================================================================
+// Each condition contributes exactly 1 point.  Maximum score = 10.
+//
+//  Grade  A  = score ≥ i_a_thresh   (default 7)
+//  Grade  A+ = score ≥ i_ap_thresh  (default 9)
+//  Trigger   = A+ grade AND displacement on the same bar
+
+score_bull = (bull_trend      ? 1 : 0)   // EMA trend confirms direction
+           + (ema_flow_bull   ? 1 : 0)   // EMA momentum expanding
+           + (in_discount     ? 1 : 0)   // price in discount zone (buy area)
+           + (raid_bull       ? 1 : 0)   // sell-side liquidity raided
+           + (mss_bull        ? 1 : 0)   // bullish market structure shift
+           + (disp_bull       ? 1 : 0)   // bullish displacement candle
+           + (in_bull_fvg     ? 1 : 0)   // retracing into bullish imbalance
+           + (vwap_align_bull ? 1 : 0)   // price aligned above VWAP
+           + (hl              ? 1 : 0)   // higher low confirms uptrend
+           + (high_vol        ? 1 : 0)   // volume surge confirms move
+
+score_bear = (bear_trend      ? 1 : 0)
+           + (ema_flow_bear   ? 1 : 0)
+           + (in_premium      ? 1 : 0)   // price in premium zone (sell area)
+           + (raid_bear       ? 1 : 0)   // buy-side liquidity raided
+           + (mss_bear        ? 1 : 0)   // bearish market structure shift
+           + (disp_bear       ? 1 : 0)   // bearish displacement candle
+           + (in_bear_fvg     ? 1 : 0)   // retracing into bearish imbalance
+           + (vwap_align_bear ? 1 : 0)   // price aligned below VWAP
+           + (lh              ? 1 : 0)   // lower high confirms downtrend
+           + (high_vol        ? 1 : 0)
+
+// Grades
+is_a_bull     = score_bull >= i_a_thresh
+is_aplus_bull = score_bull >= i_ap_thresh
+is_a_bear     = score_bear >= i_a_thresh
+is_aplus_bear = score_bear >= i_ap_thresh
+
+// Trigger = A+ grade confirmed by displacement (highest-conviction entry)
+trigger_bull  = is_aplus_bull and disp_bull
+trigger_bear  = is_aplus_bear and disp_bear
+
+// Edge detectors – fire only when grade first appears
+a_bull_edge   = is_a_bull     and not is_a_bull[1]
+ap_bull_edge  = is_aplus_bull and not is_aplus_bull[1]
+a_bear_edge   = is_a_bear     and not is_a_bear[1]
+ap_bear_edge  = is_aplus_bear and not is_aplus_bear[1]
+
+// =============================================================================
+// SECTION 4 – COMMUNICATION
+// =============================================================================
+
+// ── 4.1  Indicator Plots: EMAs & VWAP ────────────────────────────────────────
+plot(ema_f, "Fast EMA",
+     color     = color.new(color.blue,   0),
+     linewidth = 1)
+plot(ema_s, "Slow EMA",
+     color     = color.new(color.orange, 0),
+     linewidth = 1)
+plot(i_use_vwap ? vwap_val : na, "VWAP",
+     color     = color.new(color.purple, 0),
+     linewidth = 1,
+     style     = plot.style_circles)
+
+// ── 4.2  Premium / Discount Zones ────────────────────────────────────────────
+var box box_prem = na
+var box box_disc = na
+
+if i_show_zones and barstate.islast
+    box.delete(box_prem)
+    box.delete(box_disc)
+    box_prem := box.new(bar_index - i_liq_lb, range_hi, bar_index, range_mid,
+                        border_color = C_PREM, bgcolor = C_PREM, border_width = 1)
+    box_disc := box.new(bar_index - i_liq_lb, range_mid, bar_index, range_lo,
+                        border_color = C_DISC, bgcolor = C_DISC, border_width = 1)
+
+// ── 4.3  Fair Value Gap Boxes ────────────────────────────────────────────────
+if i_show_fvg and fvg_bull
+    box.new(bar_index - 2, fvg_b_top, bar_index, fvg_b_bot,
+            border_color = C_FVG_B, bgcolor = C_FVG_B, border_width = 1)
+
+if i_show_fvg and fvg_bear
+    box.new(bar_index - 2, fvg_s_top, bar_index, fvg_s_bot,
+            border_color = C_FVG_S, bgcolor = C_FVG_S, border_width = 1)
+
+// ── 4.4  Liquidity Level Lines (BSL / SSL) ────────────────────────────────────
+var line line_bsl = na
+var line line_ssl = na
+
+if i_show_liq and barstate.islast
+    if not na(last_sh) and not na(last_sh_bar)
+        line.delete(line_bsl)
+        line_bsl := line.new(last_sh_bar, last_sh, bar_index, last_sh,
+                             color  = C_LIQ,
+                             style  = line.style_dashed,
+                             width  = 1,
+                             extend = extend.right)
+    if not na(last_sl) and not na(last_sl_bar)
+        line.delete(line_ssl)
+        line_ssl := line.new(last_sl_bar, last_sl, bar_index, last_sl,
+                             color  = C_LIQ,
+                             style  = line.style_dashed,
+                             width  = 1,
+                             extend = extend.right)
+
+// ── 4.5  Structure Labels (HH / HL / LH / LL) ────────────────────────────────
+if i_show_struct
+    if not na(swing_h)
+        label.new(bar_index - i_swing_len, swing_h,
+                  hh ? "HH" : "LH",
+                  style     = label.style_label_down,
+                  color     = hh ? C_BULL : C_BEAR,
+                  textcolor = color.white,
+                  size      = size.small)
+    if not na(swing_l)
+        label.new(bar_index - i_swing_len, swing_l,
+                  hl ? "HL" : "LL",
+                  style     = label.style_label_up,
+                  color     = hl ? C_BULL : C_BEAR,
+                  textcolor = color.white,
+                  size      = size.small)
+
+// ── 4.6  Liquidity Raid Labels ────────────────────────────────────────────────
+if raid_bull
+    label.new(bar_index, low,
+              "RAID ↑\nSSL Swept",
+              style     = label.style_label_up,
+              color     = C_BULL,
+              textcolor = color.white,
+              size      = size.small)
+
+if raid_bear
+    label.new(bar_index, high,
+              "RAID ↓\nBSL Swept",
+              style     = label.style_label_down,
+              color     = C_BEAR,
+              textcolor = color.white,
+              size      = size.small)
+
+// ── 4.7  Market Structure Shift Labels ───────────────────────────────────────
+if mss_bull
+    label.new(bar_index, low,
+              "MSS ↑",
+              style     = label.style_label_up,
+              color     = C_BULL,
+              textcolor = color.white,
+              size      = size.small)
+
+if mss_bear
+    label.new(bar_index, high,
+              "MSS ↓",
+              style     = label.style_label_down,
+              color     = C_BEAR,
+              textcolor = color.white,
+              size      = size.small)
+
+// ── 4.8  A / A+ Grade Labels (edge-triggered: first bar of new grade) ─────────
+if i_show_grade_lbl and barstate.isconfirmed
+    if ap_bull_edge
+        label.new(bar_index, low,
+                  "A+  BULL\n" + str.tostring(score_bull) + " / 10",
+                  style     = label.style_label_up,
+                  color     = C_APLUS,
+                  textcolor = color.black,
+                  size      = size.normal)
+    else if a_bull_edge
+        label.new(bar_index, low,
+                  "A  BULL\n" + str.tostring(score_bull) + " / 10",
+                  style     = label.style_label_up,
+                  color     = C_A,
+                  textcolor = color.black,
+                  size      = size.normal)
+
+    if ap_bear_edge
+        label.new(bar_index, high,
+                  "A+  BEAR\n" + str.tostring(score_bear) + " / 10",
+                  style     = label.style_label_down,
+                  color     = C_APLUS,
+                  textcolor = color.black,
+                  size      = size.normal)
+    else if a_bear_edge
+        label.new(bar_index, high,
+                  "A  BEAR\n" + str.tostring(score_bear) + " / 10",
+                  style     = label.style_label_down,
+                  color     = C_A,
+                  textcolor = color.black,
+                  size      = size.normal)
+
+// ── 4.9  Trigger Markers ─────────────────────────────────────────────────────
+plotshape(trigger_bull, "Trigger Long",
+          shape.triangleup,   location.belowbar, color.lime, size = size.normal)
+plotshape(trigger_bear, "Trigger Short",
+          shape.triangledown, location.abovebar, color.red,  size = size.normal)
+
+// ── 4.10  Dashboard Table ─────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 14,
+                           bgcolor      = color.new(color.black, 55),
+                           border_width = 1,
+                           border_color = color.new(color.white, 70))
+
+if i_show_dash and barstate.islast
+
+    // ── Header ───────────────────────────────────────────────────────────────
+    table.cell(dash, 0, 0, "SNAP ULTRA A+ HUB",
+               text_color = color.white,
+               bgcolor    = color.new(color.navy, 10),
+               text_size  = size.small)
+    table.cell(dash, 1, 0, "BULL  |  BEAR",
+               text_color = color.white,
+               bgcolor    = color.new(color.navy, 10),
+               text_size  = size.small)
+
+    // ── Market-State Rows ─────────────────────────────────────────────────────
+    table.cell(dash, 0,  1, "Trend (EMA)",
+               text_color = color.white, bgcolor = f_bg(bull_trend or bear_trend), text_size = size.small)
+    table.cell(dash, 1,  1, f_tick(bull_trend) + "  |  " + f_tick(bear_trend),
+               text_color = color.white, bgcolor = f_bg(bull_trend or bear_trend), text_size = size.small)
+
+    table.cell(dash, 0,  2, "EMA Flow",
+               text_color = color.white, bgcolor = f_bg(ema_flow_bull or ema_flow_bear), text_size = size.small)
+    table.cell(dash, 1,  2, f_tick(ema_flow_bull) + "  |  " + f_tick(ema_flow_bear),
+               text_color = color.white, bgcolor = f_bg(ema_flow_bull or ema_flow_bear), text_size = size.small)
+
+    table.cell(dash, 0,  3, "Building Liquidity",
+               text_color = color.white, bgcolor = f_bg(building_liq), text_size = size.small)
+    table.cell(dash, 1,  3, f_tick(eq_high) + " BSL  |  " + f_tick(eq_low) + " SSL",
+               text_color = color.white, bgcolor = f_bg(building_liq), text_size = size.small)
+
+    table.cell(dash, 0,  4, "Liquidity Raid",
+               text_color = color.white, bgcolor = f_bg(raid_bull or raid_bear), text_size = size.small)
+    table.cell(dash, 1,  4, f_tick(raid_bull) + " SSL  |  " + f_tick(raid_bear) + " BSL",
+               text_color = color.white, bgcolor = f_bg(raid_bull or raid_bear), text_size = size.small)
+
+    table.cell(dash, 0,  5, "MSS",
+               text_color = color.white, bgcolor = f_bg(mss_bull or mss_bear), text_size = size.small)
+    table.cell(dash, 1,  5, f_tick(mss_bull) + "  |  " + f_tick(mss_bear),
+               text_color = color.white, bgcolor = f_bg(mss_bull or mss_bear), text_size = size.small)
+
+    table.cell(dash, 0,  6, "Displacement",
+               text_color = color.white, bgcolor = f_bg(disp_bull or disp_bear), text_size = size.small)
+    table.cell(dash, 1,  6, f_tick(disp_bull) + "  |  " + f_tick(disp_bear),
+               text_color = color.white, bgcolor = f_bg(disp_bull or disp_bear), text_size = size.small)
+
+    table.cell(dash, 0,  7, "Premium / Discount",
+               text_color = color.white, bgcolor = f_bg(in_premium or in_discount), text_size = size.small)
+    table.cell(dash, 1,  7, f_tick(in_premium) + " PREM  |  " + f_tick(in_discount) + " DISC",
+               text_color = color.white, bgcolor = f_bg(in_premium or in_discount), text_size = size.small)
+
+    table.cell(dash, 0,  8, "FVG / Imbalance",
+               text_color = color.white, bgcolor = f_bg(in_bull_fvg or in_bear_fvg), text_size = size.small)
+    table.cell(dash, 1,  8, f_tick(in_bull_fvg) + "  |  " + f_tick(in_bear_fvg),
+               text_color = color.white, bgcolor = f_bg(in_bull_fvg or in_bear_fvg), text_size = size.small)
+
+    table.cell(dash, 0,  9, "VWAP Align",
+               text_color = color.white, bgcolor = f_bg(vwap_align_bull or vwap_align_bear), text_size = size.small)
+    table.cell(dash, 1,  9, f_tick(vwap_align_bull) + "  |  " + f_tick(vwap_align_bear),
+               text_color = color.white, bgcolor = f_bg(vwap_align_bull or vwap_align_bear), text_size = size.small)
+
+    table.cell(dash, 0, 10, "Volume",
+               text_color = color.white, bgcolor = f_bg(high_vol), text_size = size.small)
+    table.cell(dash, 1, 10, f_tick(high_vol) + " High Vol",
+               text_color = color.white, bgcolor = f_bg(high_vol), text_size = size.small)
+
+    // ── Score & Grade ─────────────────────────────────────────────────────────
+    table.cell(dash, 0, 11, "Score  (/ 10)",
+               text_color = color.white,  bgcolor = color.new(color.navy, 25), text_size = size.small)
+    table.cell(dash, 1, 11, str.tostring(score_bull) + "  |  " + str.tostring(score_bear),
+               text_color = color.yellow, bgcolor = color.new(color.navy, 25), text_size = size.small)
+
+    grade_b = is_aplus_bull ? "A+" : is_a_bull ? "A" : "–"
+    grade_s = is_aplus_bear ? "A+" : is_a_bear ? "A" : "–"
+    table.cell(dash, 0, 12, "Grade",
+               text_color = color.white, bgcolor = color.new(color.navy, 25), text_size = size.small)
+    table.cell(dash, 1, 12, grade_b + "  |  " + grade_s,
+               text_color = color.lime,  bgcolor = color.new(color.navy, 25), text_size = size.small)
+
+    // ── Signal Row ────────────────────────────────────────────────────────────
+    trig_txt = trigger_bull ? "⬆  TRIGGER LONG"  :
+               trigger_bear ? "⬇  TRIGGER SHORT" : "⬜  WAIT"
+    trig_bg  = trigger_bull ? color.new(color.lime, 20) :
+               trigger_bear ? color.new(color.red,  20) :
+               color.new(color.gray, 60)
+    table.cell(dash, 0, 13, "Signal",
+               text_color = color.white, bgcolor = trig_bg, text_size = size.small)
+    table.cell(dash, 1, 13, trig_txt,
+               text_color = color.white, bgcolor = trig_bg, text_size = size.small)
+
+// =============================================================================
+// SECTION 4.11 – ALERTS  (machine-readable)
+// =============================================================================
+alertcondition(trigger_bull,
+               "A+ Long Trigger",
+               "SNAP A+ HUB – A+ LONG trigger fired")
+
+alertcondition(trigger_bear,
+               "A+ Short Trigger",
+               "SNAP A+ HUB – A+ SHORT trigger fired")
+
+alertcondition(raid_bull,
+               "Sell-Side Liquidity Raided",
+               "SNAP A+ HUB – Sell-side liquidity (SSL) has been raided (bullish)")
+
+alertcondition(raid_bear,
+               "Buy-Side Liquidity Raided",
+               "SNAP A+ HUB – Buy-side liquidity (BSL) has been raided (bearish)")
+
+alertcondition(mss_bull,
+               "Bullish Market Structure Shift",
+               "SNAP A+ HUB – Bullish MSS: close broke above last swing high")
+
+alertcondition(mss_bear,
+               "Bearish Market Structure Shift",
+               "SNAP A+ HUB – Bearish MSS: close broke below last swing low")
+
+alertcondition(disp_bull,
+               "Bullish Displacement",
+               "SNAP A+ HUB – Bullish displacement candle detected")
+
+alertcondition(disp_bear,
+               "Bearish Displacement",
+               "SNAP A+ HUB – Bearish displacement candle detected")
+
+alertcondition(fvg_bull,
+               "Bullish FVG Created",
+               "SNAP A+ HUB – Bullish fair value gap created")
+
+alertcondition(fvg_bear,
+               "Bearish FVG Created",
+               "SNAP A+ HUB – Bearish fair value gap created")
+
+alertcondition(building_liq,
+               "Building Liquidity",
+               "SNAP A+ HUB – Liquidity building detected (equal highs or lows)")
+
+alertcondition(vwap_cross_bull,
+               "Bullish VWAP Cross",
+               "SNAP A+ HUB – Price crossed above VWAP")
+
+alertcondition(vwap_cross_bear,
+               "Bearish VWAP Cross",
+               "SNAP A+ HUB – Price crossed below VWAP")
+
+alertcondition(is_aplus_bull or is_aplus_bear,
+               "A+ Grade Signal",
+               "SNAP A+ HUB – A+ grade confluence signal reached")
+
+alertcondition(is_a_bull or is_a_bear,
+               "A Grade Signal",
+               "SNAP A+ HUB – A grade confluence signal reached")
